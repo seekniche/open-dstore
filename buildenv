@@ -22,7 +22,7 @@ fi
 #-------------------------------------------
 # code path
 #-------------------------------------------
-export BUILD_ROOT=/xxx/dstore
+export BUILD_ROOT=/home/hbc/codes/dstore_proj/dstore
 export LOCAL_LIB_PATH=$BUILD_ROOT/../local_libs
 
 #-------------------------------------------

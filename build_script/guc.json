@@ -122,7 +122,7 @@
     "clusterId" : 1,
     "enableQuickStartUp true": "",
     "enableQuickStartUp": true,
-    "startConfigPath": "",
+    "startConfigPath": "/home/hbc/codes/dstore_proj/dstore/tests/tpcctest/../../build_script/dstore_conf.json",
     "bgDiskWriterSlaveNum" : 1,
     "bgPageWriterSleepMilliSecond" : 2000,
     "walThrottlingSize" : 1048576,

@@ -145,13 +145,13 @@ add_custom_target(run_dstore_ha_unittest
 #--------add tpcctest cmake command start--------
 add_custom_target(run_dstore_tpcctest
     COMMAND cd ${CMAKE_SOURCE_DIR}/tests
-     && sh build_and_run_tpcctest.sh -t ${LOCAL_LIB_PATH} -u ${UTILS_HOME} -r true
+     && bash build_and_run_tpcctest.sh -t ${LOCAL_LIB_PATH} -u ${UTILS_HOME} -r true
     COMMENT "run dstore one-node tpcctest"
 )
 
 add_custom_target(run_dstore_tpcctest_asan
     COMMAND cd ${CMAKE_SOURCE_DIR}/tests
-     && sh build_and_run_tpcctest.sh -t ${LOCAL_LIB_PATH} -u ${UTILS_HOME} -r true -a ON
+     && bash build_and_run_tpcctest.sh -t ${LOCAL_LIB_PATH} -u ${UTILS_HOME} -r true -a ON
     COMMENT "run dstore one-node tpcctest"
 )
 #--------add tpcctest cmake command end--------
