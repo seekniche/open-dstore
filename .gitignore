@@ -4,3 +4,13 @@ output/
 tmp_build*
 build
 .claude/
+
+
+
+include/config.h
+interface/framework/dstore_io_event.h
+interface/framework/dstore_wait_state.h
+src/common/instrument/wait_event/io_event.cpp
+src/common/instrument/wait_event/io_event.h
+src/common/instrument/wait_event/wait_state.cpp
+src/common/instrument/wait_event/wait_state.h

@@ -75,8 +75,9 @@ static ErrorDetails *g_errorCodeMap[] = {
     [MODULE_MEMNODE] = nullptr,
     [MODULE_PDBREPLICA] = nullptr,
     [MODULE_RECOVERY] = g_recovery_error_code_map,
-    [MODULE_LOGICAL_REPLICATION] = g_logical_replication_error_code_map, 
+    [MODULE_LOGICAL_REPLICATION] = g_logical_replication_error_code_map,
     [MODULE_PDB] = g_pdb_error_code_map,
+    [MODULE_WATCHDOG] = nullptr,
     [MODULE_MAX] = nullptr
 };
 
@@ -107,6 +108,7 @@ static int g_errorNumberOfCodesMap[] = {
     [MODULE_RECOVERY] = sizeof(g_recovery_error_code_map) / sizeof(ErrorDetails),
     [MODULE_LOGICAL_REPLICATION] = sizeof(g_logical_replication_error_code_map) / sizeof(ErrorDetails),
     [MODULE_PDB] = sizeof(g_pdb_error_code_map) / sizeof(ErrorDetails),
+    [MODULE_WATCHDOG] = 0,
     [MODULE_MAX] = 0
 };
 
