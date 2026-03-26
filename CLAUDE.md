@@ -54,13 +54,21 @@ dstore/
 |----|------|
 | `BufMgr` | Buffer Pool 主管理器，实现 `Read/Write/MarkDirty/Release` 等 |
 | `BufferDesc` | Buffer 描述符，含 page 指针、引用计数、状态标志、LRU 节点 |
-| `BgDiskPageMasterWriter` | Buffer 刷脏后台线程（主线程），每个 WAL stream 一个 |
-| `BgDiskPageSlaveWriter` | Buffer 刷脏从线程 |
+| `BgDiskPageMasterWriter` | Buffer 刷脏调度线程（Master），每个 WAL stream 一个；负责扫描脏页队列、决定刷哪些页、唤醒 Slave、等待 Slave 完成、推进 recoveryPlsn，**本身不写磁盘** |
+| `BgDiskPageSlaveWriter` | Buffer 刷脏执行线程（Slave），由 Master 管理；从共享的 `CandidateFlushCxt` 抢占一批脏页后调用 `FlushCandidateDirtyPage()` 实际写磁盘（支持 AIO）；Slave 数量由 GUC `bgDiskWriterSlaveNum` 控制，每个 Master 可有多个 Slave |
 | `BgPageWriterMgr` | 管理所有 BgPageWriter 实例 |
 | `CheckpointMgr` | Checkpoint 后台线程，定期推进 checkpoint |
 | `BufferRing` | 批量读/写时使用的环形 Buffer 复用策略 |
 
 Buffer 状态标志（`Buffer::BUF_*`）：32位引用计数 + 高位 flags，原子 CAS 操作。
+
+**BgDiskPageMasterWriter / BgDiskPageSlaveWriter 协作流程**：
+1. Master `Run()` 主循环：调用 `ScanDirtyListForFlush()` 从脏页队列扫出候选页，填入共享的 `CandidateFlushCxt`
+2. Master 调用 `WakeUpSlaveWriter()` 唤醒所有 Slave
+3. 每个 Slave 调用 `SeizeDirtyPageListForFlush()` 用原子操作从 `CandidateFlushCxt` 抢占一批（最多 1000 页），再调用 `FlushCandidateDirtyPage()` 实际写磁盘（同步或 AIO）
+4. Master 调用 `WaitSlaveWriterFlushFinish()` 等所有 Slave 完成
+5. Master 调用 `AdvanceHeadAfterFlush()` 推进脏页队列头指针和 `recoveryPlsn`
+6. Checkpoint 时，外部调用 `FlushAllDirtyPages()`：设置 `m_flushAll=true`，等待 `recoveryPlsn >= maxAppendedPlsn`
 
 ### `src/wal/` — Write-Ahead Log
 
@@ -205,8 +213,8 @@ struct BufferDesc {
 |------|----|--------|------|
 | WAL 刷盘 | `BgWalWriter` | `BgFlushMain()` | 每个 `WalStream` 一个 |
 | Checkpoint | `CheckpointMgr` | `CheckpointerMain()` | 每个 PDB 一个 |
-| Buffer 刷脏（主） | `BgDiskPageMasterWriter` | `Run()` | 每个 WAL stream 一个 |
-| Buffer 刷脏（从） | `BgDiskPageSlaveWriter` | `Run()` | 可多个 |
+| Buffer 刷脏（调度） | `BgDiskPageMasterWriter` | `Run()` | 每个 WAL stream 一个；扫脏页、协调 Slave、推进 recoveryPlsn |
+| Buffer 刷脏（执行） | `BgDiskPageSlaveWriter` | `Run()` | 每个 Master 可多个（`bgDiskWriterSlaveNum`）；实际调用 Flush/AIO 写磁盘 |
 | WAL 文件回收 | `WalFileManager` | `RecycleWalFileWorkerMain()` | 每个 `WalFileManager` 一个 |
 | Undo 回收调度 | `RollbackTrxTaskMgr` | `DispatchMain()` | 每个 PDB 一个 |
 | Undo 回收工作 | `RollbackTrxWorker` | 工作线程 | 多个（最多10个） |
