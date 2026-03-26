@@ -26,11 +26,13 @@
 #ifndef DSTORE_DSTORE_WAL_BGWRITER_H
 #define DSTORE_DSTORE_WAL_BGWRITER_H
 
+#include <atomic>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
 
 #include "dstore_wal_buffer.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 class WalStream;
@@ -100,6 +102,9 @@ private:
     std::atomic<bool> m_needStop;
     bool m_isRunning;
     std::atomic<bool> m_isSleeping;
+    /* WatchDog heartbeat: updated each main-loop iteration (seconds since epoch, 0 = not running) */
+    std::atomic<uint64> m_lastHeartbeatTime;
+    WatchDogEntry m_watchdogEntry;
 
     std::thread *m_bgThread;
     std::mutex m_runningStateMtx;

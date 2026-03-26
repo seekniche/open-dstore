@@ -56,7 +56,9 @@ RollbackTrxTaskMgr::RollbackTrxTaskMgr(PdbId pdbId)
       m_dispatchThread(nullptr),
       m_needStop(false),
       m_isDispatching(false),
-      m_pdbId(pdbId)
+      m_pdbId(pdbId),
+      m_lastHeartbeatTime(0),
+      m_watchdogEntry("RollbackTrxMgr", &m_lastHeartbeatTime, WATCHDOG_UNDO_RECYCLE_TIMEOUT_S, pdbId)
 {}
 
 RollbackTrxTaskMgr::~RollbackTrxTaskMgr()
@@ -212,7 +214,19 @@ void RollbackTrxTaskMgr::DispatchMain(PdbId pdbId)
 
     (void)pthread_setname_np(pthread_self(), "RollbackTrxMgr");
 
-    DoDispatch();
+    {
+        StoragePdb *pdb = g_storageInstance->GetPdb(pdbId);
+        WatchDogMgr *watchdogMgr = (pdb != nullptr) ? pdb->GetWatchDogMgr() : nullptr;
+        if (watchdogMgr != nullptr) {
+            watchdogMgr->Register(&m_watchdogEntry);
+        }
+        DoDispatch();
+        /* Clear heartbeat so watchdog knows the thread has stopped */
+        m_lastHeartbeatTime.store(0, std::memory_order_relaxed);
+        if (watchdogMgr != nullptr) {
+            watchdogMgr->Unregister(&m_watchdogEntry);
+        }
+    }
 
     if (thrd != nullptr) {
         g_storageInstance->RemoveVisibleThread(thrd);
@@ -226,6 +240,8 @@ void RollbackTrxTaskMgr::DispatchMain(PdbId pdbId)
 void RollbackTrxTaskMgr::DoDispatch()
 {
 Dispatch:
+    /* Update watchdog heartbeat at the start of each iteration */
+    m_lastHeartbeatTime.store(static_cast<uint64>(time(nullptr)), std::memory_order_relaxed);
     if (m_needStop.load(std::memory_order_acquire) && IsAllTaskFinished()) {
         return;
     }

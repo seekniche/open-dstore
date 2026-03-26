@@ -121,7 +121,8 @@ StoragePdb::StoragePdb(PdbId pdbId)
       m_numOfNoSendBarrier(0),
       m_needRollbackBarrierInFailover(false),
       m_rollbackBarrierCsn(INVALID_CSN),
-      m_barrierLastEndPlsn(0)
+      m_barrierLastEndPlsn(0),
+      m_watchdogMgr(nullptr)
 {
     m_asyncStopAndDropWalThrdCnt.store(0, std::memory_order_release);
     RWLockInit(&m_oidGenRWLock, RWLOCK_PREFER_WRITER_NP);
@@ -177,7 +178,8 @@ StoragePdb::StoragePdb(PdbId pdbId, const char* pdbUuid)
       m_numOfNoSendBarrier(0),
       m_needRollbackBarrierInFailover(false),
       m_rollbackBarrierCsn(INVALID_CSN),
-      m_barrierLastEndPlsn(0)
+      m_barrierLastEndPlsn(0),
+      m_watchdogMgr(nullptr)
 {
     m_asyncStopAndDropWalThrdCnt.store(0, std::memory_order_release);
     RWLockInit(&m_oidGenRWLock, RWLOCK_PREFER_WRITER_NP);
@@ -267,6 +269,10 @@ RetStatus StoragePdb::Destroy()
     DestroyCheckpointMgr();
     DestroyTransactionMgr();
     DestroyControlFile();
+    if (m_watchdogMgr != nullptr) {
+        DstorePfree(m_watchdogMgr);
+        m_watchdogMgr = nullptr;
+    }
     RWLockDestroy(&m_oidGenRWLock);
     RWLockDestroy(&m_builtinRelMap.relMapRWLock);
     m_builtinRelMap.sharedRelMap.count = 0;
@@ -1040,6 +1046,11 @@ ObjSpaceMgr *StoragePdb::GetObjSpaceMgr()
 CheckpointMgr *StoragePdb::GetCheckpointMgr()
 {
     return m_checkpointMgr;
+}
+
+WatchDogMgr *StoragePdb::GetWatchDogMgr()
+{
+    return m_watchdogMgr;
 }
 
 RetStatus StoragePdb::FullCheckpoint()
@@ -2143,6 +2154,12 @@ void StoragePdb::StartBgThread()
     }
     AutoMemCxtSwitch autoSwitch(g_storageInstance->m_memoryMgr->GetGroupContext(MEMORY_CONTEXT_LONGLIVE));
     m_stopBgThread = false;
+    if (m_watchdogMgr == nullptr) {
+        m_watchdogMgr = DstoreNew(g_dstoreCurrentMemoryContext) WatchDogMgr();
+    }
+    if (m_watchdogMgr != nullptr) {
+        m_watchdogMgr->Start(m_pdbId);
+    }
     if (GetPdbRoleMode() == PdbRoleMode::PDB_PRIMARY) {
         StartupBgPageWriterAndCkptThread();
         StartupUndoRecycleThread();
@@ -2320,6 +2337,9 @@ void StoragePdb::StopBgThread(bool needFullCheckpoint, bool usedToDrPdbreplica)
         m_bgPageWriterMgr->StopAllBgPageWriter();
     }
     ErrLog(DSTORE_LOG, MODULE_FRAMEWORK, ErrMsg("[StopBgThread] All BgPageWriter stopped, pdbId=%u", m_pdbId));
+    if (m_watchdogMgr != nullptr) {
+        m_watchdogMgr->Stop();
+    }
     ErrLog(DSTORE_LOG, MODULE_FRAMEWORK, ErrMsg("[StopBgThread] Finished stopping bg threads of pdb %u", m_pdbId));
 }
 

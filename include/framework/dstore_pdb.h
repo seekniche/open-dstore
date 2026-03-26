@@ -38,6 +38,7 @@
 #include "dstore_vfs_adapter.h"
 #include "pdb/dstore_pdb_interface.h"
 #include "wal/dstore_wal_redo_manager.h"
+#include "framework/dstore_watchdog.h"
 namespace DSTORE {
 
 #ifdef UT
@@ -211,6 +212,7 @@ public:
     virtual RetStatus CreateNewVFS();
     virtual RetStatus MountExistingVFS(const char *vfsName);
     virtual class BgPageWriterMgr *GetBgPageWriterMgr();
+    virtual class WatchDogMgr *GetWatchDogMgr();
     virtual RetStatus BgPageWriterMgrInit();
     virtual void BgPageWriterMgrDestroy();
     RetStatus DropWalPath(char *pdbPath) const;
@@ -536,6 +538,7 @@ public:
     class ObjSpaceMgr *m_objSpaceMgr;
     class CheckpointMgr *m_checkpointMgr;
     class BgPageWriterMgr *m_bgPageWriterMgr;
+    class WatchDogMgr *m_watchdogMgr;
     Oid m_nextOid = FIRST_BOOTSTRAP_OBJECT_ID;  /* next OID to assign */
     uint32 m_cachedOidCnt = 0;     /* the number of unused cached OID */
     RWLock m_oidGenRWLock;         /* For concurrent application of OIDs in the same PDB */

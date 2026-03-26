@@ -45,7 +45,9 @@ BgWalWriter::BgWalWriter(DstoreMemoryContext mct, WalStream *stream, PdbId pdbId
     m_memoryContext(mct),
     m_stream(stream),
     m_pdbId(pdbId),
-    m_isInThrottling(false)
+    m_isInThrottling(false),
+    m_lastHeartbeatTime(0),
+    m_watchdogEntry("BgWalWriter", &m_lastHeartbeatTime, WATCHDOG_WAL_BGWRITER_TIMEOUT_S, pdbId)
 {
 }
 
@@ -100,7 +102,17 @@ void FlushWorkThd(BgWalWriter *bgWalWriter, PdbId pdbId)
             }
         }
     }
-    bgWalWriter->BgFlushMain();
+    {
+        StoragePdb *pdb = g_storageInstance->GetPdb(pdbId);
+        WatchDogMgr *watchdogMgr = (pdb != nullptr) ? pdb->GetWatchDogMgr() : nullptr;
+        if (watchdogMgr != nullptr) {
+            watchdogMgr->Register(&bgWalWriter->m_watchdogEntry);
+        }
+        bgWalWriter->BgFlushMain();
+        if (watchdogMgr != nullptr) {
+            watchdogMgr->Unregister(&bgWalWriter->m_watchdogEntry);
+        }
+    }
     if (STORAGE_FUNC_FAIL(UnRegisterThreadToBind(pthread_self(), BindType::CPU_BIND))) {
         ErrLog(DSTORE_WARNING, MODULE_FRAMEWORK, ErrMsg("BgWalWriter UnRegisterThreadToBind fail"));
     }
@@ -161,6 +173,8 @@ void BgWalWriter::BgFlushMain()
     ErrLog(DSTORE_LOG, MODULE_WAL, ErrMsg("[PDB:%u, WAL:%lu]BgWalWriter start", m_pdbId, m_stream->GetWalId()));
     /* Step 1: keep doing main work if not needStop */
     while (likely(!m_needStop.load(std::memory_order_relaxed))) {
+        /* Update watchdog heartbeat at the start of each iteration */
+        m_lastHeartbeatTime.store(static_cast<uint64>(time(nullptr)), std::memory_order_relaxed);
         /* record the start time */
         double initStart = static_cast<double>(GetSystemTimeInMicrosecond());
         uint64 flushedDataLen = m_stream->Flush();
@@ -196,6 +210,8 @@ void BgWalWriter::BgFlushMain()
         std::unique_lock<std::mutex> lock(m_runningStateMtx);
         m_isRunning = false;
     }
+    /* Clear heartbeat so watchdog knows the thread has stopped */
+    m_lastHeartbeatTime.store(0, std::memory_order_relaxed);
     ErrLog(DSTORE_LOG, MODULE_WAL, ErrMsg("[PDB:%u, WAL:%lu]BgWalWriter stop", m_pdbId, m_stream->GetWalId()));
     /* Step 3: notify caller of BgWalWriter::Stop */
     m_runningStateCv.notify_all();

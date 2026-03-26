@@ -20,6 +20,7 @@
 #include "port/dstore_port.h"
 #include "lock/dstore_lwlock.h"
 #include "framework/dstore_thread.h"
+#include "framework/dstore_pdb.h"
 #include "buffer/dstore_buf_mgr.h"
 #include "buffer/dstore_bg_page_writer_mgr.h"
 #include "buffer/dstore_bg_disk_page_writer.h"
@@ -30,8 +31,17 @@ void CheckpointMgr::CheckpointerMain()
 {
     AutoMemCxtSwitch autoSwitch{m_checkpointContext};
 
+    StoragePdb *storagePdbInit = g_storageInstance->GetPdb(m_pdbId);
+    WatchDogMgr *watchdogMgr = (storagePdbInit != nullptr) ? storagePdbInit->GetWatchDogMgr() : nullptr;
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Register(&m_watchdogEntry);
+    }
+
     while (true) {
 LOOP:
+        /* Update watchdog heartbeat at the start of each iteration */
+        m_lastHeartbeatTime.store(static_cast<uint64>(time(nullptr)), std::memory_order_relaxed);
+
         Timestamp now;
         Timestamp elapsedTime;
 
@@ -114,6 +124,11 @@ LOOP:
         for (int i = 0; i < waitTimeInMs && !m_shutdownRequested; i++) {
             GaussUsleep(STORAGE_USECS_PER_MSEC);
         }
+    }
+    /* Clear heartbeat so watchdog knows the thread has stopped */
+    m_lastHeartbeatTime.store(0, std::memory_order_relaxed);
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Unregister(&m_watchdogEntry);
     }
 }
 

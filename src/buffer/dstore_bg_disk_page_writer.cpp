@@ -45,7 +45,9 @@ bool g_enableAsyncIoFlush = false;
 BgDiskPageMasterWriter::BgDiskPageMasterWriter(const WalStream *walStream, DirtyPageQueue *dirtyPageQueue,
     PdbId pdbId, int64 slotId)
     : m_slaveWriterArray(nullptr), m_walStream(walStream), m_dirtyPageQueue(dirtyPageQueue), m_recoveryPlsn(0),
-      m_slaveNum(1), m_pdbId(pdbId), m_slotId(slotId), m_flushAll(false)
+      m_slaveNum(1), m_pdbId(pdbId), m_slotId(slotId), m_flushAll(false),
+      m_lastHeartbeatTime(0),
+      m_watchdogEntry("BgDiskPageWriter", &m_lastHeartbeatTime, WATCHDOG_BUF_PAGEWRITER_TIMEOUT_S, pdbId)
 {}
 
 RetStatus BgDiskPageMasterWriter::Init()
@@ -106,7 +108,14 @@ void BgDiskPageMasterWriter::Run()
     StoragePdb *pdb = g_storageInstance->GetPdb(m_pdbId);
     StorageReleasePanic(pdb == nullptr, MODULE_BGPAGEWRITER, ErrMsg("pdb %u is nullptr", m_pdbId));
 
+    WatchDogMgr *watchdogMgr = pdb->GetWatchDogMgr();
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Register(&m_watchdogEntry);
+    }
+
     for (;;) {
+        /* Update watchdog heartbeat at the start of each iteration */
+        m_lastHeartbeatTime.store(static_cast<uint64>(time(nullptr)), std::memory_order_relaxed);
         /* exit if get the request */
         if (IsStop()) {
             Destroy();
@@ -172,6 +181,11 @@ void BgDiskPageMasterWriter::Run()
         /* sleep for next turn flush */
         SmartSleep();
         RefreshNextFlushTime();
+    }
+    /* Clear heartbeat so watchdog knows the thread has stopped */
+    m_lastHeartbeatTime.store(0, std::memory_order_relaxed);
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Unregister(&m_watchdogEntry);
     }
     ErrLog(DSTORE_LOG, MODULE_BGPAGEWRITER, ErrMsg("BgDiskPageMasterWriter pdbId %u, %lu exited MainLoop", m_pdbId,
         thrd->GetCore()->pid));

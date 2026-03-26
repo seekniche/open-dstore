@@ -24,6 +24,7 @@
 #include "lock/dstore_lwlock.h"
 #include "wal/dstore_wal.h"
 #include "wal/dstore_wal_struct.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 class WalStream;
@@ -155,7 +156,9 @@ public:
           m_inited(false),
           m_isFullCkpting(false),
           m_requestedCheckpoints(0),
-          m_walMgr(walMgr)
+          m_walMgr(walMgr),
+          m_lastHeartbeatTime(0),
+          m_watchdogEntry("Checkpointer", &m_lastHeartbeatTime, WATCHDOG_CHECKPOINTER_TIMEOUT_S, pdbId)
     {
         m_queueSpinlock.Init();
     }
@@ -222,6 +225,9 @@ private:
     uint32 m_requestedCheckpoints;
 
     WalManager *m_walMgr;
+    /* WatchDog heartbeat: updated each main-loop iteration (0 = not running) */
+    std::atomic<uint64> m_lastHeartbeatTime;
+    WatchDogEntry m_watchdogEntry;
 
     WalCheckpointInfoData *FindCheckpointInfo(WalId walId);
 

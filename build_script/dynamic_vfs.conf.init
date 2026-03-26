@@ -1,7 +1,7 @@
-type = PageStore
-vfsLibPath = /home/PageStore/lib/libsalofflinefileisdata.so
-vfsName = GaussPageStore
-vfsClusterName = PageStoreCluster
+type = TenantIsolation
+vfsLibPath = /home/hbc/codes/dstore_proj/dstore/utils/output/lib/libvfslinuxadapter.so
+vfsName = GaussTenantIsolation
+vfsClusterName = cluster
 pageStoreClusterId = 3
 pageStoreCMNodeId = 1
 pageStoreCMIp = 127.0.0.2

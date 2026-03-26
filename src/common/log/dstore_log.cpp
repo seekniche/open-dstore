@@ -66,6 +66,7 @@ const ModuleData moduleMap[] = {
     {MODULE_RECOVERY,            "RECOVERY"},
     {MODULE_LOGICAL_REPLICATION, "MODULE_LOGICAL_REPLICATION"},
     {MODULE_PDB,                 "PDB"},
+    {MODULE_WATCHDOG,            "WATCHDOG"},
     {MODULE_MAX,                 "MAX"},
 };
 static_assert(MODULE_MAX == sizeof(moduleMap) / sizeof(moduleMap[0]) - 1, "invalid moduleMap size.");

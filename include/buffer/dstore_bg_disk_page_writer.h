@@ -31,6 +31,7 @@
 #include "buffer/dstore_bg_page_writer_mgr.h"
 #include "buffer/dstore_buf_mgr.h"
 #include "buffer/dstore_bg_page_writer_base.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -112,6 +113,9 @@ private:
     std::atomic<bool> m_flushAll;
     std::mutex m_mtx;
     static constexpr long m_waitStep = 100 * 1000;
+    /* WatchDog heartbeat: updated each main-loop iteration (0 = not running) */
+    std::atomic<uint64> m_lastHeartbeatTime;
+    WatchDogEntry m_watchdogEntry;
 };
 
 class BgDiskPageSlaveWriter final : public BgPageSlaveWriter {

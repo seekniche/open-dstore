@@ -1,0 +1,6 @@
+.vscode/
+output/
+.git/
+tmp_build*
+build
+.claude/

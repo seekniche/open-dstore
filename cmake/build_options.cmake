@@ -89,6 +89,9 @@ if(${ENABLE_UT} STREQUAL "ON" OR ${ENABLE_LCOV} STREQUAL "ON")
     list(REMOVE_ITEM WARNING_OPTIONS -Werror)
     # UT test need change binaries to libraries,set -fPIC during compling
     list(APPEND BIN_SECURE_OPTIONS -fPIC)
+    # Disable PIE so the unittest binary can link against non-PIE static gtest
+    # (required for gcc >= 8 which enables PIE by default on modern distros)
+    list(APPEND BIN_LINK_OPTIONS -no-pie)
 else()
     # libraries need secure options during compling
     list(APPEND BIN_SECURE_OPTIONS -fPIE)
@@ -193,6 +196,8 @@ if (ENABLE_UT STREQUAL "ON")
     option(DISABLE_UNDO_MOCK "OFF means using undo mock implementation" OFF)
     set(UT_LIBS gmock_maind gtestd gmockd)
     if(${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "x86_64")
+        # The pre-built gtest/gmock in local_libs use old ABI; compile UT code
+        # with the same ABI so link succeeds (applies to any GCC version).
         list(APPEND MACRO_OPTIONS -D_GLIBCXX_USE_CXX11_ABI=0)
         set(UT_LIBS gmock_main gtest gmock)
     endif()

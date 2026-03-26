@@ -36,6 +36,7 @@
 #include "transaction/dstore_transaction_types.h"
 #include "framework/dstore_instance.h"
 #include "undo/dstore_undo_zone.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -117,6 +118,9 @@ private:
     std::atomic<bool> m_needStop;
     std::atomic<bool> m_isDispatching;
     PdbId m_pdbId;
+    /* WatchDog heartbeat: updated each main-loop iteration (0 = not running) */
+    std::atomic<uint64> m_lastHeartbeatTime;
+    WatchDogEntry m_watchdogEntry;
 
     void DispatchMain(PdbId pdbId);
     void DoDispatch();

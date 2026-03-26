@@ -1,4 +1,7 @@
-set(LOCAL_LIB_PATH $ENV{LOCAL_LIB_PATH})
+if(NOT LOCAL_LIB_PATH)
+    set(LOCAL_LIB_PATH $ENV{LOCAL_LIB_PATH})
+endif()
+set(LOCAL_LIB_PATH "${LOCAL_LIB_PATH}" CACHE PATH "Path to local libraries" FORCE)
 
 if(NOT EXISTS "${LOCAL_LIB_PATH}")
     message(FATAL_ERROR "LOCAL_LIB_PATH(${LOCAL_LIB_PATH}) Not EXISTS! Please check local_libs exists")
@@ -50,6 +53,15 @@ set(GTEST_HOME ${LOCAL_LIB_PATH}/gtest)
 set(GTEST_INCLUDE_PATH ${GTEST_HOME}/include)
 set(GTEST_LIB_PATH ${GTEST_HOME}/lib)
 message("-- GTEST_HOME: ${GTEST_HOME}")
+
+############################################################################
+# mockcpp component
+############################################################################
+set(MOCKCPP_HOME ${LOCAL_LIB_PATH}/mockcpp)
+set(MOCKCPP_INCLUDE_PATH ${MOCKCPP_HOME}/include)
+set(MOCKCPP_3RDPARTY_PATH ${MOCKCPP_HOME}/include/fake_boost)
+set(MOCKCPP_LIB_PATH ${MOCKCPP_HOME}/lib)
+message("-- MOCKCPP_HOME: ${MOCKCPP_HOME}")
 
 #############################################################################
 # secure component

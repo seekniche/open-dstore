@@ -34,6 +34,7 @@
 #include "framework/dstore_instance.h"
 #include "framework/dstore_vfs_adapter.h"
 #include "dstore_wal_file_reader.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 #ifdef UT
@@ -338,6 +339,9 @@ private:
     bool m_dioRw;
     std::atomic_bool m_pauseWalFileRecycle;
     uint64 m_pauseWalFileRecycleCnt;
+    /* WatchDog heartbeat: updated each main-loop iteration (0 = not running) */
+    std::atomic<uint64> m_lastHeartbeatTime;
+    WatchDogEntry *m_watchdogEntry;
 };
 
 }

@@ -53,6 +53,7 @@ enum ModuleId : unsigned char {
     MODULE_RECOVERY,
     MODULE_LOGICAL_REPLICATION,
     MODULE_PDB,
+    MODULE_WATCHDOG,
     MODULE_MAX
 };
 

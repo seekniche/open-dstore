@@ -342,7 +342,9 @@ WalFileManager::WalFileManager(DstoreMemoryContext memoryContext)
       m_recoveryRecycleFinish(false),
       m_dioRw(false),
       m_pauseWalFileRecycle(false),
-      m_pauseWalFileRecycleCnt(0)
+      m_pauseWalFileRecycleCnt(0),
+      m_lastHeartbeatTime(0),
+      m_watchdogEntry(nullptr)
 {
     m_initWalFilesPara = {};
     RWLockInit(&m_fileLock, RWLOCK_PREFER_READER_NP);
@@ -553,8 +555,17 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
     ErrLog(DSTORE_LOG, MODULE_WAL, ErrMsg("RecycleWalFileWorker starts, pdbName: %s, walId: %lu.",
         pdb->GetPdbName(), m_initWalFilesPara.walId));
 
+    m_watchdogEntry = new WatchDogEntry("WalFileRecycler", &m_lastHeartbeatTime,
+                                        WATCHDOG_WAL_RECYCLE_TIMEOUT_S, m_initWalFilesPara.pdbId);
+    WatchDogMgr *watchdogMgr = pdb->GetWatchDogMgr();
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Register(m_watchdogEntry);
+    }
+
     constexpr long sleepTimeInMs = 10;
     while (!m_stopBgRecycleThread.load(std::memory_order_relaxed)) {
+        /* Update watchdog heartbeat at the start of each iteration */
+        m_lastHeartbeatTime.store(static_cast<uint64>(time(nullptr)), std::memory_order_relaxed);
         PauseRecycleIfNeed();
 
         if (isDropping) {
@@ -593,6 +604,11 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
     }
 
 RECYCLE_WAL_END:
+    /* Clear heartbeat so watchdog knows the thread has stopped */
+    m_lastHeartbeatTime.store(0, std::memory_order_relaxed);
+    if (watchdogMgr != nullptr && m_watchdogEntry != nullptr) {
+        watchdogMgr->Unregister(m_watchdogEntry);
+    }
     g_storageInstance->UnregisterThread();
 }
 
@@ -950,6 +966,10 @@ WalFile *WalFileManager::GetWalFileByFileDescriptor(FileDescriptor *fd)
 void WalFileManager::Destroy()
 {
     StopRecycleWalFileWorker();
+    if (m_watchdogEntry != nullptr) {
+        delete m_watchdogEntry;
+        m_watchdogEntry = nullptr;
+    }
     WalFile *walFile = m_headFile;
     while (walFile) {
         WalFile *next = GetNextWalFile(walFile, false);
