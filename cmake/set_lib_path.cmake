@@ -77,6 +77,14 @@ set(LZ4_BIN_PATH ${LZ4_HOME}/bin)
 message("-- LZ4_HOME: ${LZ4_HOME}")
 
 ############################################################################
+# mockcpp component
+############################################################################
+set(MOCKCPP_HOME ${LOCAL_LIB_PATH}/mockcpp)
+set(MOCKCPP_INCLUDE_PATH ${MOCKCPP_HOME}/include)
+set(MOCKCPP_3RDPARTY_PATH ${MOCKCPP_HOME}/include/mockcpp)
+set(MOCKCPP_LIB_PATH ${MOCKCPP_HOME}/lib)
+
+############################################################################
 # utils lib new component
 ############################################################################
 set(UTILS_HOME ${CMAKE_SOURCE_DIR}/utils/output)
