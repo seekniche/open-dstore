@@ -24,6 +24,7 @@
 #include "lock/dstore_lwlock.h"
 #include "wal/dstore_wal.h"
 #include "wal/dstore_wal_struct.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 class WalStream;
@@ -228,6 +229,8 @@ private:
     RetStatus CheckpointOneWalStream(WalId walId, CheckpointFlag flags, bool *isPerformed);
 
     RetStatus CreateCheckpoint(WalId walId, CheckpointFlag flags, bool *isPerformed);
+
+    WatchDogHandle *m_watchdogHandle = nullptr;
 };
 
 void DumpAllWalSteamCkptInfo(StringInfoData &dumpInfo, uint32 walStreamNum, WalCheckpointStatInfo *walCkptStatInfo);

@@ -31,6 +31,7 @@
 #include "buffer/dstore_bg_page_writer_mgr.h"
 #include "buffer/dstore_buf_mgr.h"
 #include "buffer/dstore_bg_page_writer_base.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -112,11 +113,12 @@ private:
     std::atomic<bool> m_flushAll;
     std::mutex m_mtx;
     static constexpr long m_waitStep = 100 * 1000;
+    WatchDogHandle *m_watchdogHandle = nullptr;
 };
 
 class BgDiskPageSlaveWriter final : public BgPageSlaveWriter {
 public:
-    explicit BgDiskPageSlaveWriter(CandidateFlushCxt *flushCxt, BgDiskPageMasterWriter* master);
+    explicit BgDiskPageSlaveWriter(CandidateFlushCxt *flushCxt, BgDiskPageMasterWriter* master, uint32 slaveIndex);
     ~BgDiskPageSlaveWriter() final = default;
     DISALLOW_COPY_AND_MOVE(BgDiskPageSlaveWriter);
 
@@ -159,6 +161,8 @@ private:
     bool m_useAio;
     BgDiskPageMasterWriter* m_master;
     BatchBufferAioContextMgr* batchCtxMgr;
+    uint32 m_slaveIndex;
+    WatchDogHandle *m_watchdogHandle = nullptr;
 };
 
 } /* namespace DSTORE */

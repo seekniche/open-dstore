@@ -32,6 +32,7 @@
 #include "dstore_wal_struct.h"
 #include "control/dstore_control_file.h"
 #include "framework/dstore_instance.h"
+#include "framework/dstore_watchdog.h"
 #include "framework/dstore_vfs_adapter.h"
 #include "dstore_wal_file_reader.h"
 
@@ -338,6 +339,8 @@ private:
     bool m_dioRw;
     std::atomic_bool m_pauseWalFileRecycle;
     uint64 m_pauseWalFileRecycleCnt;
+
+    WatchDogHandle *m_watchdogHandle = nullptr;
 };
 
 }

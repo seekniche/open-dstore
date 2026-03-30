@@ -38,6 +38,7 @@
 #include "dstore_vfs_adapter.h"
 #include "pdb/dstore_pdb_interface.h"
 #include "wal/dstore_wal_redo_manager.h"
+#include "framework/dstore_watchdog.h"
 namespace DSTORE {
 
 #ifdef UT
@@ -431,6 +432,8 @@ public:
 
     BgDiskPageMasterWriter *GetBgDiskPageMasterWriter() const;
 
+    WatchDogMgr *GetWatchDogMgr() const { return m_watchdogMgr; }
+
     inline void AddActiveTransaction()
     {
         (void)GsAtomicAddFetchU32(&m_activeTransactionNum, 1);
@@ -562,6 +565,8 @@ protected:
 
     void InitCheckpointMgr();
     void DestroyCheckpointMgr();
+    void InitWatchDogMgr();
+    void DestroyWatchDogMgr();
 
     virtual RetStatus InitWalMgr();
     virtual void DestroyWalMgr();
@@ -616,6 +621,9 @@ protected:
         unsigned int timeout = OBJSPACEMGR_SLEEP_TIME_IN_MS;
         (void)usleep(timeout * 1000U);
     }
+
+    WatchDogMgr *m_watchdogMgr;
+    WatchDogHandle *m_undoRecycleWdHandle = nullptr;
 
     class std::thread *m_recycleUndoThread;
     class std::thread *m_asyncRecoverUndoThread;

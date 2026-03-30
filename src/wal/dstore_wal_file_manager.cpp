@@ -31,6 +31,7 @@
 #include "buffer/dstore_checkpointer.h"
 #include "wal/dstore_wal_perf_unit.h"
 #include "wal/dstore_wal_file_manager.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 static constexpr uint32 WAIT_COUNT_FOR_REPORT_WARNING = 5000;
@@ -553,6 +554,17 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
     ErrLog(DSTORE_LOG, MODULE_WAL, ErrMsg("RecycleWalFileWorker starts, pdbName: %s, walId: %lu.",
         pdb->GetPdbName(), m_initWalFilesPara.walId));
 
+    WatchDogMgr *watchdogMgr = pdb->GetWatchDogMgr();
+    if (watchdogMgr != nullptr) {
+        m_watchdogHandle = watchdogMgr->Register(
+            WatchDogThreadType::WAL_FILE_RECYCLE, static_cast<uint32>(m_initWalFilesPara.walId), "WalRecycler");
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
+    } else {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDogMgr is null when registering WalRecycler, pdbId=%u.",
+                   m_initWalFilesPara.pdbId));
+    }
+
     constexpr long sleepTimeInMs = 10;
     while (!m_stopBgRecycleThread.load(std::memory_order_relaxed)) {
         PauseRecycleIfNeed();
@@ -567,6 +579,7 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
         }
 
         /* Step 1: wait m_headFile recyclable */
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         while (!WalFileRecyclable(m_headFile)) {
             /* Step 1.1: N = maxFreeWalFileCount - curFreeWalFileCount if N > 0, create N wal files and append */
             if (pdb->GetPdbRoleMode() != PdbRoleMode::PDB_STANDBY &&
@@ -583,6 +596,7 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
                 GaussUsleep(STORAGE_USECS_PER_MSEC);
             }
         }
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         /* Step 2: N = maxFreeWalFileCount - curFreeWalFileCount
          * if N > 0, rename and append this wal file; else, remove it */
         if (GetFreeWalFileCount() < m_initWalFilesPara.maxFreeWalFileCount) {
@@ -590,9 +604,14 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
         } else if (GetAllWalFileCount() > m_initWalFilesPara.initWalFileCount) {
             RemoveHeadFile();
         }
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
     }
 
 RECYCLE_WAL_END:
+    if (watchdogMgr != nullptr) {
+        watchdogMgr->Unregister(m_watchdogHandle);
+        m_watchdogHandle = nullptr;
+    }
     g_storageInstance->UnregisterThread();
 }
 

@@ -75,12 +75,12 @@ enum class ThreadRunState : uint8 {
 };
 
 // 单个线程的心跳信息
-struct WatchDogHeartbeat {
+struct WatchDogHandle {
     std::atomic<uint64> lastHeartbeatUs;         // 上次心跳时间（微秒，steady_clock）
     std::atomic<ThreadRunState> runState;         // 当前运行状态
     WatchDogThreadType threadType;                // 线程类型
     uint32 threadIndex;                           // 同类型线程的索引（如 slave writer 0/1/2...）
-    const char *threadName;                       // 线程名称（用于日志和诊断输出）
+    char threadName[64];                           // 线程名称（固定数组，Register 时 strncpy 拷贝）
     std::atomic<bool> registered;                 // 是否已注册（用于遍历时跳过空槽位）
 };
 ```
@@ -92,8 +92,14 @@ struct WatchDogHeartbeat {
 
 class WatchDogMgr {
 public:
+    WatchDogMgr();
+    ~WatchDogMgr();
+    DISALLOW_COPY_AND_MOVE(WatchDogMgr);
+
     // 生命周期
     RetStatus Init(PdbId pdbId);
+    void StartThread();     // 启动 WatchDog 线程，阻塞等待线程就绪后返回
+    void WaitReady() const; // 阻塞等待 m_ready 标志
     void Destroy();
 
     // === 被监控线程调用的接口 ===
@@ -101,47 +107,60 @@ public:
     // 注册一个被监控线程，返回心跳句柄（指针）
     // 线程启动时调用，传入类型、索引、名称
     // 超时阈值从 GUC 参数读取
-    WatchDogHeartbeat *Register(WatchDogThreadType type, uint32 index,
+    WatchDogHandle *Register(WatchDogThreadType type, uint32 index,
                                 const char *threadName);
 
     // 注销，线程退出时调用
-    void Unregister(WatchDogHeartbeat *heartbeat);
+    void Unregister(WatchDogHandle *heartbeat);
 
     // 心跳更新（被监控线程在主循环中调用）
     // 内联实现，尽量轻量
-    static inline void TouchHeartbeat(WatchDogHeartbeat *hb);
+    static inline void TouchHeartbeat(WatchDogHandle *hb);
 
     // 设置线程状态（可选，用于区分 RUNNING/SLEEPING）
-    static inline void SetRunState(WatchDogHeartbeat *hb, ThreadRunState state);
+    static inline void SetRunState(WatchDogHandle *hb, ThreadRunState state);
 
     // === WatchDog 线程内部方法 ===
 
     // WatchDog 主循环（作为后台线程运行）
     void WatchDogThreadMain();
 
-    // === 内部查询方法（供 WatchDogDiagnose 调用） ===
-
-    // 获取当前所有心跳的快照
-    uint32 GetHeartbeatSnapshot(WatchDogHeartbeat *outArray, uint32 maxCount) const;
-
-    // 获取指定类型的心跳
-    uint32 GetHeartbeatsByType(WatchDogThreadType type,
-                               WatchDogHeartbeat *outArray, uint32 maxCount) const;
-
-private:
-    // 检查所有心跳，对超时的打印 ERROR 日志
-    void CheckAllHeartbeats();
+    // === 查询方法（供 WatchDogDiagnose 及外部调用） ===
 
     // 根据线程类型从 GUC 获取超时阈值（微秒）
     uint64 GetTimeoutUsFromGuc(WatchDogThreadType type) const;
 
-    PdbId m_pdbId;
-    std::atomic<bool> m_stop;
-    std::thread *m_watchdogThread;
+    // 获取当前稳定时钟时间（微秒）
+    static uint64 GetSteadyClockUs();
+
+    // 获取当前所有心跳的快照
+    uint32 GetHeartbeatSnapshot(WatchDogHandle *outArray, uint32 maxCount) const;
+
+    // 获取指定类型的心跳
+    uint32 GetHeartbeatsByType(WatchDogThreadType type,
+                               WatchDogHandle *outArray, uint32 maxCount) const;
+
+    // 查询接口
+    PdbId GetPdbId() const;
+    bool IsStopped() const;
+    bool IsReady() const;
+    uint32 GetRegisteredCount() const;
 
     // 心跳数组（固定大小，预分配）
     static constexpr uint32 MAX_WATCHED_THREADS = 64;
-    WatchDogHeartbeat m_heartbeats[MAX_WATCHED_THREADS];
+
+#ifndef UT
+private:
+#endif
+    // 检查所有心跳，对超时的打印 ERROR 日志
+    void CheckAllHeartbeats();
+
+    PdbId m_pdbId;
+    std::atomic<bool> m_stop;
+    std::atomic<bool> m_ready;        // WatchDog 线程就绪标志，StartThread 阻塞等待此标志
+    std::thread *m_watchdogThread;
+
+    WatchDogHandle m_heartbeats[MAX_WATCHED_THREADS];
     std::atomic<uint32> m_registeredCount;
 };
 ```
@@ -149,7 +168,7 @@ private:
 ### 3.3 心跳更新（内联，零开销）
 
 ```cpp
-inline void WatchDogMgr::TouchHeartbeat(WatchDogHeartbeat *hb)
+inline void WatchDogMgr::TouchHeartbeat(WatchDogHandle *hb)
 {
     if (hb == nullptr) {
         return;
@@ -160,7 +179,7 @@ inline void WatchDogMgr::TouchHeartbeat(WatchDogHeartbeat *hb)
     hb->lastHeartbeatUs.store(nowUs, std::memory_order_relaxed);
 }
 
-inline void WatchDogMgr::SetRunState(WatchDogHeartbeat *hb, ThreadRunState state)
+inline void WatchDogMgr::SetRunState(WatchDogHandle *hb, ThreadRunState state)
 {
     if (hb != nullptr) {
         hb->runState.store(state, std::memory_order_relaxed);
@@ -175,21 +194,21 @@ inline void WatchDogMgr::SetRunState(WatchDogHeartbeat *hb, ThreadRunState state
 ```cpp
 void BgDiskPageMasterWriter::Run()
 {
-    m_watchdogHb = watchdogMgr->Register(
-        WatchDogThreadType::BG_PAGE_MASTER_WRITER, m_slotId, "MasterWriter");
+    m_watchdogHandle = watchdogMgr->Register(
+        WatchDogThreadType::BG_PAGE_MASTER_WRITER, static_cast<uint32>(m_slotId), "MasterWriter");
 
     for (;;) {
         if (IsStop()) { break; }
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::RUNNING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         // ... 扫描脏页、唤醒 slave、等待完成 ...
-        WatchDogMgr::TouchHeartbeat(m_watchdogHb);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::SLEEPING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         SmartSleep();
     }
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_watchdogHandle);
 }
 ```
 
@@ -198,21 +217,21 @@ void BgDiskPageMasterWriter::Run()
 ```cpp
 void BgDiskPageSlaveWriter::Run()
 {
-    m_watchdogHb = watchdogMgr->Register(
-        WatchDogThreadType::BG_PAGE_SLAVE_WRITER, m_slaveId, "SlaveWriter");
+    m_watchdogHandle = watchdogMgr->Register(
+        WatchDogThreadType::BG_PAGE_SLAVE_WRITER, m_slaveIndex, "SlaveWriter");
 
     while (true) {
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::SLEEPING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         WaitNextFlush();
 
         if (IsStop()) { break; }
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::RUNNING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         // ... SeizeDirtyPageListForFlush + FlushCandidateDirtyPage ...
-        WatchDogMgr::TouchHeartbeat(m_watchdogHb);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
     }
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_watchdogHandle);
 }
 ```
 
@@ -221,21 +240,21 @@ void BgDiskPageSlaveWriter::Run()
 ```cpp
 void CheckpointMgr::CheckpointerMain()
 {
-    m_watchdogHb = watchdogMgr->Register(
+    m_watchdogHandle = watchdogMgr->Register(
         WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
 
     while (true) {
         if (m_shutdownRequested) { break; }
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::RUNNING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         // ... 遍历 WAL stream 做 checkpoint ...
-        WatchDogMgr::TouchHeartbeat(m_watchdogHb);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::SLEEPING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         // 1 秒轮询休眠
     }
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_watchdogHandle);
 }
 ```
 
@@ -244,19 +263,21 @@ void CheckpointMgr::CheckpointerMain()
 ```cpp
 void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
 {
-    m_watchdogHb = watchdogMgr->Register(
-        WatchDogThreadType::WAL_FILE_RECYCLE, m_walId, "RecWalWorker");
+    m_watchdogHandle = watchdogMgr->Register(
+        WatchDogThreadType::WAL_FILE_RECYCLE,
+        static_cast<uint32>(m_initWalFilesPara.walId), "WalRecycler");
 
     while (!m_stopBgRecycleThread.load()) {
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::RUNNING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         // ... 回收逻辑 ...
-        WatchDogMgr::TouchHeartbeat(m_watchdogHb);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::SLEEPING);
-        // 10ms 休眠
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
+        // 10ms 休眠等待循环
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
     }
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_watchdogHandle);
 }
 ```
 
@@ -265,14 +286,14 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
 ```cpp
 void StoragePdb::RecycleUndoThreadMain()
 {
-    m_watchdogHb = watchdogMgr->Register(
-        WatchDogThreadType::UNDO_RECYCLE, 0, "UndoRecycle");
+    m_undoRecycleWdHandle = watchdogMgr->Register(
+        WatchDogThreadType::UNDO_RECYCLE, 0, "UndoRecycler");
 
     // ... 等待备份恢复完成 ...
     // RecycleUndo() 内部循环中需要埋入心跳
     RecycleUndo();
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_undoRecycleWdHandle);
 }
 ```
 
@@ -281,21 +302,21 @@ void StoragePdb::RecycleUndoThreadMain()
 ```cpp
 void BtreeRecycleWorker::BtreeRecycleThreadMain()
 {
-    m_watchdogHb = watchdogMgr->Register(
-        WatchDogThreadType::BTREE_RECYCLE, 0, "IndexRecycle");
+    m_watchdogHandle = watchdogMgr->Register(
+        WatchDogThreadType::BTREE_RECYCLE, m_workeId, "BtreeRecycler");
 
     while (!m_stopRecyleThread) {
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::SLEEPING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         thrd->Sleep();
 
         if (m_stopRecyleThread) { break; }
 
-        WatchDogMgr::SetRunState(m_watchdogHb, ThreadRunState::RUNNING);
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         // ... 执行回收任务 ...
-        WatchDogMgr::TouchHeartbeat(m_watchdogHb);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
     }
 
-    watchdogMgr->Unregister(m_watchdogHb);
+    watchdogMgr->Unregister(m_watchdogHandle);
 }
 ```
 
@@ -372,8 +393,23 @@ void WatchDogMgr::WatchDogThreadMain()
 {
     while (!m_stop.load(std::memory_order_relaxed)) {
         CheckAllHeartbeats();
-        uint32 intervalSec = g_storageInstance->GetGuc()->watchdogCheckIntervalSec;
-        SleepInChunks(intervalSec);
+
+        uint32 intervalSec = 5;
+        const StorageGUC *guc = (g_storageInstance != nullptr) ? g_storageInstance->GetGuc() : nullptr;
+        if (guc != nullptr) {
+            intervalSec = guc->watchdogCheckIntervalSec;
+        }
+        if (intervalSec == 0) {
+            intervalSec = 1;
+        }
+
+        uint32 totalChunks = (intervalSec * 1000) / SLEEP_CHUNK_MS;
+        for (uint32 i = 0; i < totalChunks; i++) {
+            if (m_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_CHUNK_MS));
+        }
     }
 }
 
@@ -383,7 +419,7 @@ void WatchDogMgr::CheckAllHeartbeats()
     uint32 count = m_registeredCount.load(std::memory_order_acquire);
 
     for (uint32 i = 0; i < count; i++) {
-        WatchDogHeartbeat *hb = &m_heartbeats[i];
+        WatchDogHandle *hb = &m_heartbeats[i];
 
         if (!hb->registered.load(std::memory_order_relaxed)) {
             continue;
@@ -400,7 +436,7 @@ void WatchDogMgr::CheckAllHeartbeats()
         uint64 timeoutUs = GetTimeoutUsFromGuc(hb->threadType);
 
         if (elapsed > timeoutUs) {
-            ErrLog(DSTORE_ERROR, MODULE_FRAMEWORK,
+            ErrLog(DSTORE_ERROR, MODULE_WATCHDOG,
                 ErrMsg("WatchDog: thread '%s' (type=%d, index=%u) appears STUCK. "
                        "Last heartbeat was %lu us ago (timeout=%lu us).",
                        hb->threadName, (int)hb->threadType, hb->threadIndex,
@@ -485,33 +521,33 @@ RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId,
     if (pdb == nullptr || pdb->GetWatchDogMgr() == nullptr) {
         *outArray = nullptr;
         *outCount = 0;
-        return RET_ERR;
+        return DSTORE_FAIL;
     }
 
     WatchDogMgr *mgr = pdb->GetWatchDogMgr();
 
     // 获取心跳快照
-    WatchDogHeartbeat snapshot[WatchDogMgr::MAX_WATCHED_THREADS];
+    WatchDogHandle snapshot[WatchDogMgr::MAX_WATCHED_THREADS];
     uint32 count = mgr->GetHeartbeatSnapshot(snapshot, WatchDogMgr::MAX_WATCHED_THREADS);
 
     if (count == 0) {
         *outArray = nullptr;
         *outCount = 0;
-        return RET_OK;
+        return DSTORE_SUCC;
     }
 
     // 分配输出数组
-    auto *result = (WatchDogThreadStatus *)palloc(sizeof(WatchDogThreadStatus) * count);
-    uint64 nowUs = GetSteadyClockUs();
+    auto *result = (WatchDogThreadStatus *)DstorePalloc(sizeof(WatchDogThreadStatus) * count);
+    uint64 nowUs = WatchDogMgr::GetSteadyClockUs();
 
     for (uint32 i = 0; i < count; i++) {
-        const WatchDogHeartbeat &hb = snapshot[i];
+        const WatchDogHandle &hb = snapshot[i];
         WatchDogThreadStatus &status = result[i];
 
         // 填充结构化数据
         errno_t rc = strncpy_s(status.threadName, sizeof(status.threadName),
                                hb.threadName, sizeof(status.threadName) - 1);
-        securec_check(rc, "", "");
+        storage_securec_check(rc, "", "");
         status.threadType = hb.threadType;
         status.threadIndex = hb.threadIndex;
         status.runState = hb.runState.load(std::memory_order_relaxed);
@@ -525,13 +561,13 @@ RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId,
 
     *outArray = result;
     *outCount = count;
-    return RET_OK;
+    return DSTORE_SUCC;
 }
 
 void WatchDogDiagnose::FreeThreadStatusArray(WatchDogThreadStatus *arr)
 {
     if (arr != nullptr) {
-        pfree(arr);
+        DstorePfree(arr);
     }
 }
 ```
@@ -550,9 +586,9 @@ MasterWriter         BG_PAGE_MASTER       0      RUNNING    NO        0.5       
 SlaveWriter          BG_PAGE_SLAVE        0      SLEEPING   NO        2.1         60
 SlaveWriter          BG_PAGE_SLAVE        1      RUNNING    NO        0.3         60
 Checkpointer         CHECKPOINTER         0      RUNNING    NO        1.2         600
-RecWalWorker         WAL_FILE_RECYCLE     0      SLEEPING   NO        5.0         30
-UndoRecycle          UNDO_RECYCLE         0      RUNNING    NO        3.4         120
-IndexRecycle         BTREE_RECYCLE        0      SLEEPING   NO        120.5       1800
+WalRecycler          WAL_FILE_RECYCLE     0      SLEEPING   NO        5.0         30
+UndoRecycler         UNDO_RECYCLE         0      RUNNING    NO        3.4         120
+BtreeRecycler        BTREE_RECYCLE        0      SLEEPING   NO        120.5       1800
 
 Stuck Threads: 0
 ================================================================
@@ -586,7 +622,7 @@ if (STORAGE_FUNC_SUCC(ret)) {
 char *summary = WatchDogDiagnose::GetFormattedSummary(pdbId);
 if (summary != nullptr) {
     // 输出到客户端或日志
-    pfree(summary);
+    DstorePfree(summary);
 }
 ```
 
@@ -594,7 +630,7 @@ if (summary != nullptr) {
 
 ```
 include/framework/
-    dstore_watchdog.h                  # WatchDogMgr、WatchDogHeartbeat、枚举等定义
+    dstore_watchdog.h                  # WatchDogMgr、WatchDogHandle、枚举等定义
 
 src/framework/
     dstore_watchdog.cpp                # WatchDogMgr 实现（Init/Destroy/Register/Unregister/
@@ -609,8 +645,9 @@ interface/framework/
     dstore_instance_interface.h        # StorageGUC 新增 watchdog* 字段（GUC 参数）
 
 tests/unittest/src/ut_watchdog/
-    ut_watchdog.cpp                    # WatchDogMgr 核心逻辑 UT
-    ut_watchdog_diagnose.cpp           # WatchDogDiagnose 接口 UT
+    ut_watchdog_mgr.cpp                # WatchDogMgr 核心逻辑测试
+    ut_watchdog_diagnose.cpp           # WatchDogDiagnose 接口测试
+    ut_watchdog_integration.cpp        # 后台线程生命周期集成测试
 ```
 
 ## 5. 集成点
@@ -618,17 +655,26 @@ tests/unittest/src/ut_watchdog/
 ### 5.1 WatchDogMgr 生命周期（挂在 StoragePdb 上）
 
 ```
-StoragePdb::OpenPdb() / InitPdb()
-    → WatchDogMgr::Init(pdbId)
-
-StoragePdb::StartBgThread()
-    → 启动 WatchDog 后台线程（m_watchdogThread）
-    → 各后台线程启动时自行 Register()
+StoragePdb::InitPdb() / OpenPdb()
+    → InitWatchDogMgr()（在 InitWalMgr 之前调用，确保先于所有后台线程）
+        → 创建 WatchDogMgr，调用 Init(pdbId) + StartThread()
+        → StartThread() 内部阻塞等待 m_ready 标志，确保 WatchDog 线程已进入主循环
+    → InitWalMgr()（WAL 回收线程在此启动，此时 WatchDog 已在运行）
+    → ... 其他 Manager 初始化 ...
+    → StartBgThread()（启动其他后台线程，WatchDog 已在监控中）
 
 StoragePdb::StopBgThread()
-    → WatchDogMgr::Destroy()（先于其他线程停止，避免误报）
+    → m_stopBgThread = true
     → 停止各后台线程
+
+StoragePdb::DestroyMgr()（在 StopBgThread 之后调用）
+    → ... 销毁各 Manager（DestroyWalMgr 停止 WAL 回收线程等）...
+    → DestroyWatchDogMgr()（作为 LAST action，确保所有后台线程已停止后再销毁 WatchDog）
 ```
+
+**启动校验机制**：`WatchDogMgr::StartThread()` 创建线程后调用 `WaitReady()` 阻塞等待，
+`WatchDogThreadMain()` 入口处设置 `m_ready = true`（memory_order_release），
+`WaitReady()` 循环检查 `m_ready`（memory_order_acquire），确保 WatchDog 线程确实已启动后才返回。
 
 ### 5.2 StoragePdb 新增成员
 
@@ -636,7 +682,7 @@ StoragePdb::StopBgThread()
 class StoragePdb {
     // 新增
     WatchDogMgr *m_watchdogMgr;
-    std::thread *m_watchdogThread;
+    WatchDogHandle *m_undoRecycleWdHandle = nullptr;
 
 public:
     WatchDogMgr *GetWatchDogMgr() const { return m_watchdogMgr; }
@@ -647,17 +693,17 @@ public:
 
 | 文件 | 修改内容 |
 |------|---------|
-| `include/buffer/dstore_bg_disk_page_writer.h` | BgDiskPageMasterWriter / SlaveWriter 新增 `WatchDogHeartbeat *m_watchdogHb` 成员 |
+| `include/buffer/dstore_bg_disk_page_writer.h` | BgDiskPageMasterWriter / SlaveWriter 新增 `WatchDogHandle *m_watchdogHandle` 成员 |
 | `src/buffer/dstore_bg_disk_page_writer.cpp` | Run() 中埋入 Register/TouchHeartbeat/SetRunState/Unregister |
-| `include/buffer/dstore_checkpointer.h` | CheckpointMgr 新增 `WatchDogHeartbeat *m_watchdogHb` 成员 |
+| `include/buffer/dstore_checkpointer.h` | CheckpointMgr 新增 `WatchDogHandle *m_watchdogHandle` 成员 |
 | `src/buffer/dstore_checkpointer.cpp` | CheckpointerMain() 中埋入心跳 |
-| `include/wal/dstore_wal_file_manager.h` | WalFileManager 新增 `WatchDogHeartbeat *m_watchdogHb` 成员 |
+| `include/wal/dstore_wal_file_manager.h` | WalFileManager 新增 `WatchDogHandle *m_watchdogHandle` 成员 |
 | `src/wal/dstore_wal_file_manager.cpp` | RecycleWalFileWorkerMain() 中埋入心跳 |
-| `include/undo/dstore_undo_mgr.h` | UndoMgr 新增 `WatchDogHeartbeat *m_watchdogHb` 成员 |
+| `include/framework/dstore_pdb.h` | StoragePdb 新增 `WatchDogHandle *m_undoRecycleWdHandle` 成员 |
 | `src/framework/dstore_pdb.cpp` | RecycleUndoThreadMain() 中埋入心跳 |
-| `include/index/dstore_btree_page_recycle.h` | BtreeRecycleWorker 新增 `WatchDogHeartbeat *m_watchdogHb` 成员 |
+| `include/index/dstore_btree_page_recycle.h` | BtreeRecycleWorker 新增 `WatchDogHandle *m_watchdogHandle` 成员 |
 | `src/index/dstore_btree_page_recycle.cpp` | BtreeRecycleThreadMain() 中埋入心跳 |
-| `include/framework/dstore_pdb.h` | StoragePdb 新增 m_watchdogMgr / m_watchdogThread / GetWatchDogMgr() |
+| `include/framework/dstore_pdb.h` | StoragePdb 新增 m_watchdogMgr / m_undoRecycleWdHandle / GetWatchDogMgr() |
 | `src/framework/dstore_pdb.cpp` | OpenPdb/StartBgThread/StopBgThread 中集成 WatchDogMgr |
 | `interface/framework/dstore_instance_interface.h` | StorageGUC 新增 watchdog* GUC 参数字段 |
 
@@ -693,7 +739,7 @@ enum class DstoreWatchDogFI {
 ```cpp
 // src/framework/dstore_watchdog.cpp
 
-WatchDogHeartbeat *WatchDogMgr::Register(WatchDogThreadType type, uint32 index,
+WatchDogHandle *WatchDogMgr::Register(WatchDogThreadType type, uint32 index,
                                           const char *threadName)
 {
 #ifdef UT
@@ -720,18 +766,18 @@ RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId, ...)
     if (pdb == nullptr || pdb->GetWatchDogMgr() == nullptr) {
         *outArray = nullptr;
         *outCount = 0;
-        return RET_ERR;
+        return DSTORE_FAIL;
     }
 
     // ... 分配内存 ...
-    auto *result = (WatchDogThreadStatus *)palloc(sizeof(WatchDogThreadStatus) * count);
+    auto *result = (WatchDogThreadStatus *)DstorePalloc(sizeof(WatchDogThreadStatus) * count);
 #ifdef UT
-    FAULT_INJECTION_ACTION(DstoreWatchDogFI::PALLOC_FAIL, { pfree(result); result = nullptr; });
+    FAULT_INJECTION_ACTION(DstoreWatchDogFI::PALLOC_FAIL, { DstorePfree(result); result = nullptr; });
 #endif
     if (result == nullptr) {
         *outArray = nullptr;
         *outCount = 0;
-        return RET_ERR;
+        return DSTORE_FAIL;
     }
     // ...
 }
@@ -741,61 +787,41 @@ RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId, ...)
 
 ```
 tests/unittest/src/ut_watchdog/
-    ut_watchdog.cpp                    # WatchDogMgr 核心逻辑测试
+    ut_watchdog_mgr.cpp                # WatchDogMgr 核心逻辑测试
     ut_watchdog_diagnose.cpp           # WatchDogDiagnose 接口测试
+    ut_watchdog_integration.cpp        # 后台线程生命周期集成测试
 ```
 
 ### 6.3 测试 Fixture 与故障注入注册
 
 ```cpp
-// ut_watchdog.cpp
+// ut_watchdog_mgr.cpp
 
 #include "fault_injection/fault_injection.h"
 #include "common/fault_injection/dstore_watchdog_fault_injection.h"
 
-class WatchDogTestBase : public ::testing::Test {
+class WatchDogMgrTest : public DSTORETEST {
 protected:
     void SetUp() override {
-        // 注册故障注入点
-        FaultInjectionEntry entries[] = {
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::REGISTER_FAIL, false, nullptr),
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::GET_PDB_FAIL, false, nullptr),
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::GET_WATCHDOG_MGR_FAIL, false, nullptr),
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::PALLOC_FAIL, false, nullptr),
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::GET_GUC_FAIL, false, nullptr),
-            FAULT_INJECTION_ENTRY(DstoreWatchDogFI::CHECK_HEARTBEAT_SKIP, false, nullptr),
-        };
-        ASSERT_EQ(RegisterFaultInjection(entries, sizeof(entries) / sizeof(entries[0]), FI_GLOBAL),
-                  ERROR_SYS_OK);
-
-        // 初始化 mock GUC（设置各 watchdog* 字段默认值）
-        InitMockGuc();
-
-        // 初始化 WatchDogMgr
-        m_mgr = new WatchDogMgr();
-        m_mgr->Init(TEST_PDB_ID);
+        DSTORETEST::SetUp();
+        MockStorageInstance *inst = DstoreNew(m_ut_memory_context) MockStorageInstance();
+        inst->Install(&DSTORETEST::m_guc, m_ut_memory_context);
+        inst->Startup(&DSTORETEST::m_guc);
+        DSTORE::StoragePdb *pdb = g_storageInstance->GetPdb(g_defaultPdbId);
+        ASSERT_NE(nullptr, pdb);
+        m_mgr = pdb->GetWatchDogMgr();
+        ASSERT_NE(nullptr, m_mgr);
     }
 
     void TearDown() override {
-        // 确保所有故障注入点已关闭
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::REGISTER_FAIL, FI_GLOBAL);
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::GET_PDB_FAIL, FI_GLOBAL);
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::GET_WATCHDOG_MGR_FAIL, FI_GLOBAL);
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::PALLOC_FAIL, FI_GLOBAL);
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::GET_GUC_FAIL, FI_GLOBAL);
-        FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::CHECK_HEARTBEAT_SKIP, FI_GLOBAL);
-
-        m_mgr->Destroy();
-        delete m_mgr;
+        m_mgr = nullptr;
+        MockStorageInstance *inst = (MockStorageInstance *)g_storageInstance;
+        inst->Shutdown();
+        delete inst;
+        DSTORETEST::TearDown();
     }
 
-    // 辅助方法：模拟时间流逝（通过直接修改 heartbeat 的 lastHeartbeatUs）
-    void SimulateElapsed(WatchDogHeartbeat *hb, uint64 elapsedUs) {
-        uint64 nowUs = GetSteadyClockUs();
-        hb->lastHeartbeatUs.store(nowUs - elapsedUs, std::memory_order_relaxed);
-    }
-
-    WatchDogMgr *m_mgr;
+    DSTORE::WatchDogMgr *m_mgr;
 };
 ```
 
@@ -832,7 +858,7 @@ TEST_F(WatchDogTestBase, Register_FaultInjection)
     // 激活故障注入，模拟 Register 内部失败
     FAULT_INJECTION_ACTIVE(DstoreWatchDogFI::REGISTER_FAIL, FI_GLOBAL);
 
-    WatchDogHeartbeat *hb = m_mgr->Register(
+    WatchDogHandle *hb = m_mgr->Register(
         WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
     EXPECT_EQ(hb, nullptr);  // 故障注入导致失败
 
@@ -918,7 +944,7 @@ TEST_F(WatchDogTestBase, Register_FaultInjection)
 TEST_F(WatchDogDiagnoseTest, GetAll_PallocFail)
 {
     // 先注册一个线程，使 count > 0
-    WatchDogHeartbeat *hb = m_mgr->Register(
+    WatchDogHandle *hb = m_mgr->Register(
         WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
     ASSERT_NE(hb, nullptr);
 
@@ -928,7 +954,7 @@ TEST_F(WatchDogDiagnoseTest, GetAll_PallocFail)
     WatchDogThreadStatus *outArray = nullptr;
     uint32_t outCount = 0;
     RetStatus ret = WatchDogDiagnose::GetAllThreadStatus(TEST_PDB_ID, &outArray, &outCount);
-    EXPECT_EQ(ret, RET_ERR);
+    EXPECT_EQ(ret, DSTORE_FAIL);
     EXPECT_EQ(outArray, nullptr);
     EXPECT_EQ(outCount, 0u);
 
@@ -944,7 +970,7 @@ TEST_F(WatchDogDiagnoseTest, GetAll_NoPdb_FaultInjection)
     WatchDogThreadStatus *outArray = nullptr;
     uint32_t outCount = 0;
     RetStatus ret = WatchDogDiagnose::GetAllThreadStatus(TEST_PDB_ID, &outArray, &outCount);
-    EXPECT_EQ(ret, RET_ERR);
+    EXPECT_EQ(ret, DSTORE_FAIL);
 
     FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::GET_PDB_FAIL, FI_GLOBAL);
 }
@@ -987,9 +1013,9 @@ TEST_F(WatchDogDiagnoseTest, GetAll_NoPdb_FaultInjection)
 | 故障注入点 | 生产代码位置 | 覆盖的分支 | UT 用例 |
 |-----------|-------------|-----------|--------|
 | `REGISTER_FAIL` | `WatchDogMgr::Register()` 入口 | 函数提前返回 nullptr | `Register_FaultInjection` |
-| `GET_PDB_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` / `GetFormattedSummary()` | `pdb == nullptr` → return RET_ERR | `GetAll_NoPdb_FaultInjection`, `Summary_NoPdb_FaultInjection` |
-| `GET_WATCHDOG_MGR_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` | `pdb->GetWatchDogMgr() == nullptr` → return RET_ERR | `GetAll_NoWatchDogMgr` |
-| `PALLOC_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` 内存分配 | `result == nullptr` → return RET_ERR | `GetAll_PallocFail` |
+| `GET_PDB_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` / `GetFormattedSummary()` | `pdb == nullptr` → return DSTORE_FAIL | `GetAll_NoPdb_FaultInjection`, `Summary_NoPdb_FaultInjection` |
+| `GET_WATCHDOG_MGR_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` | `pdb->GetWatchDogMgr() == nullptr` → return DSTORE_FAIL | `GetAll_NoWatchDogMgr` |
+| `PALLOC_FAIL` | `WatchDogDiagnose::GetAllThreadStatus()` 内存分配 | `result == nullptr` → return DSTORE_FAIL | `GetAll_PallocFail` |
 | `GET_GUC_FAIL` | `WatchDogMgr::GetTimeoutUsFromGuc()` | GUC 异常时走 default 降级路径 | `GetTimeout_GucFail` |
 | `CHECK_HEARTBEAT_SKIP` | `WatchDogMgr::CheckAllHeartbeats()` | 用于验证检查被跳过后不产生告警 | `ThreadMain_CheckIntervalFromGuc` |
 
@@ -1002,16 +1028,16 @@ TEST_F(WatchDogDiagnoseTest, GetAll_NoPdb_FaultInjection)
 FAULT_INJECTION_ACTIVE_MODE_LEVEL(DstoreWatchDogFI::REGISTER_FAIL, 0, FI_GLOBAL, 2, 1);
 
 // 注册 3 个线程：前 2 个成功，第 3 个因故障注入失败
-WatchDogHeartbeat *hb1 = m_mgr->Register(WatchDogThreadType::CHECKPOINTER, 0, "Ckpt");
+WatchDogHandle *hb1 = m_mgr->Register(WatchDogThreadType::CHECKPOINTER, 0, "Ckpt");
 EXPECT_NE(hb1, nullptr);  // 第 1 次：跳过
 
-WatchDogHeartbeat *hb2 = m_mgr->Register(WatchDogThreadType::UNDO_RECYCLE, 0, "Undo");
+WatchDogHandle *hb2 = m_mgr->Register(WatchDogThreadType::UNDO_RECYCLE, 0, "Undo");
 EXPECT_NE(hb2, nullptr);  // 第 2 次：跳过
 
-WatchDogHeartbeat *hb3 = m_mgr->Register(WatchDogThreadType::BTREE_RECYCLE, 0, "Btr");
+WatchDogHandle *hb3 = m_mgr->Register(WatchDogThreadType::BTREE_RECYCLE, 0, "Btr");
 EXPECT_EQ(hb3, nullptr);  // 第 3 次：触发故障
 
-WatchDogHeartbeat *hb4 = m_mgr->Register(WatchDogThreadType::WAL_FILE_RECYCLE, 0, "Wal");
+WatchDogHandle *hb4 = m_mgr->Register(WatchDogThreadType::WAL_FILE_RECYCLE, 0, "Wal");
 EXPECT_NE(hb4, nullptr);  // 第 4 次：expect 耗尽，恢复正常
 
 FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::REGISTER_FAIL, FI_GLOBAL);

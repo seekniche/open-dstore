@@ -36,6 +36,7 @@
 #include "framework/dstore_instance.h"
 #include "common/instrument/dstore_stat.h"
 #include "buffer/dstore_bg_disk_page_writer.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -106,9 +107,23 @@ void BgDiskPageMasterWriter::Run()
     StoragePdb *pdb = g_storageInstance->GetPdb(m_pdbId);
     StorageReleasePanic(pdb == nullptr, MODULE_BGPAGEWRITER, ErrMsg("pdb %u is nullptr", m_pdbId));
 
+    WatchDogMgr *watchdogMgr = pdb->GetWatchDogMgr();
+    if (watchdogMgr != nullptr) {
+        m_watchdogHandle = watchdogMgr->Register(
+            WatchDogThreadType::BG_PAGE_MASTER_WRITER, static_cast<uint32>(m_slotId), "MasterWriter");
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
+    } else {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDogMgr is null when registering MasterWriter, pdbId=%u.", m_pdbId));
+    }
+
     for (;;) {
         /* exit if get the request */
         if (IsStop()) {
+            if (watchdogMgr != nullptr) {
+                watchdogMgr->Unregister(m_watchdogHandle);
+                m_watchdogHandle = nullptr;
+            }
             Destroy();
             BgPageWriterExit();
             break;
@@ -169,8 +184,12 @@ void BgDiskPageMasterWriter::Run()
             m_recoveryPlsn.store(recoveryPlsn, std::memory_order_release);
         }
 
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
+
         /* sleep for next turn flush */
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         SmartSleep();
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         RefreshNextFlushTime();
     }
     ErrLog(DSTORE_LOG, MODULE_BGPAGEWRITER, ErrMsg("BgDiskPageMasterWriter pdbId %u, %lu exited MainLoop", m_pdbId,
@@ -251,7 +270,7 @@ void BgDiskPageMasterWriter::Stop()
 RetStatus BgDiskPageMasterWriter::StartSlavePageWriters()
 {
     for (uint32 i = 0; i < m_slaveNum; i++) {
-        m_slaveWriterArray[i].bgSlaveDiskPageWriter = DstoreNew(m_memContext) BgDiskPageSlaveWriter(&m_flushCxt, this);
+        m_slaveWriterArray[i].bgSlaveDiskPageWriter = DstoreNew(m_memContext) BgDiskPageSlaveWriter(&m_flushCxt, this, i);
         if (STORAGE_VAR_NULL(m_slaveWriterArray[i].bgSlaveDiskPageWriter)) {
             ErrLog(DSTORE_ERROR, MODULE_BGPAGEWRITER,
                    ErrMsg("alloc memory for m_slaveWriterArray[%u].bgSlaveDiskPageWriter fail!", i));
@@ -550,8 +569,10 @@ char *BgDiskPageMasterWriter::Dump()
     return dumpInfo.data;
 }
 
-BgDiskPageSlaveWriter::BgDiskPageSlaveWriter(CandidateFlushCxt *flushCxt, BgDiskPageMasterWriter* master)
-    : BgPageSlaveWriter(flushCxt), m_useAio(USE_VFS_AIO), m_master(master), batchCtxMgr(nullptr)
+BgDiskPageSlaveWriter::BgDiskPageSlaveWriter(CandidateFlushCxt *flushCxt, BgDiskPageMasterWriter* master,
+    uint32 slaveIndex)
+    : BgPageSlaveWriter(flushCxt), m_useAio(USE_VFS_AIO), m_master(master), batchCtxMgr(nullptr),
+      m_slaveIndex(slaveIndex)
 {}
 
 void BgDiskPageSlaveWriter::SeizeDirtyPageListForFlush()
@@ -601,10 +622,28 @@ void BgDiskPageSlaveWriter::Run()
     ErrLog(DSTORE_LOG, MODULE_BGPAGEWRITER, ErrMsg("BgSlavePageWriter pdbId %u, %lu start", m_master->GetPdbId(),
         thrd->GetCore()->pid));
 
+    StoragePdb *pdb = g_storageInstance->GetPdb(m_master->GetPdbId());
+    WatchDogMgr *watchdogMgr = (pdb != nullptr) ? pdb->GetWatchDogMgr() : nullptr;
+    if (watchdogMgr != nullptr) {
+        m_watchdogHandle = watchdogMgr->Register(
+            WatchDogThreadType::BG_PAGE_SLAVE_WRITER, m_slaveIndex, "SlaveWriter");
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
+    } else {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDogMgr is null when registering SlaveWriter (index=%u), pdbId=%u.",
+                   m_slaveIndex, m_master->GetPdbId()));
+    }
+
     while (true) {
         thrd->RefreshWorkingVersionNum();
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         WaitNextFlush();
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
         if (IsStop()) {
+            if (watchdogMgr != nullptr) {
+                watchdogMgr->Unregister(m_watchdogHandle);
+                m_watchdogHandle = nullptr;
+            }
             BgPageWriterExit();
             break;
         }
@@ -614,6 +653,7 @@ void BgDiskPageSlaveWriter::Run()
             continue;
         }
         FlushCandidateDirtyPage(batchCtxMgr);
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
         if (m_useAio) {
             batchCtxMgr->FsyncBatch();
         }

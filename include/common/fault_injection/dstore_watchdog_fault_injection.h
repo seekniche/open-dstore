@@ -15,50 +15,27 @@
  * along with this program. if not, see <https://www.gnu.org/licenses/>.
  *
  * ---------------------------------------------------------------------------------------
- * IDENTIFICATION
- *        interface/framework/dstore_modules.h
+ *
+ * dstore_watchdog_fault_injection.h
  *
  * ---------------------------------------------------------------------------------------
  */
+#ifndef DSTORE_WATCHDOG_FAULT_INJECTION_H
+#define DSTORE_WATCHDOG_FAULT_INJECTION_H
 
-#ifndef DSTORE_MODULES_H
-#define DSTORE_MODULES_H
+#include "fault_injection/fault_injection.h"
 
 namespace DSTORE {
 
-enum ModuleId : unsigned char {
-    MODULE_ALL,
-    MODULE_BUFFER,
-    MODULE_BUFMGR,
-    MODULE_CATALOG,
-    MODULE_COMMON,
-    MODULE_HEAP,
-    MODULE_CONTROL,
-    MODULE_FRAMEWORK,
-    MODULE_INDEX,
-    MODULE_LOCK,
-    MODULE_PAGE,
-    MODULE_PORT,
-    MODULE_WAL,
-    MODULE_BGPAGEWRITER,
-    MODULE_TABLESPACE,
-    MODULE_SEGMENT,
-    MODULE_TRANSACTION,
-    MODULE_TUPLE,
-    MODULE_UNDO,
-    MODULE_RPC,
-    MODULE_SYSTABLE,
-    MODULE_MEMNODE,
-    MODULE_PDBREPLICA,
-    MODULE_RECOVERY,
-    MODULE_LOGICAL_REPLICATION,
-    MODULE_PDB,
-    MODULE_WATCHDOG,
-    MODULE_MAX
+enum class DstoreWatchDogFI {
+    REGISTER_FAIL,
+    GET_PDB_FAIL,
+    GET_WATCHDOG_MGR_FAIL,
+    PALLOC_FAIL,
+    GET_GUC_FAIL,
+    CHECK_HEARTBEAT_SKIP,
 };
 
-#define MODULE_DISTRIBUTE_OFFSET        (MODULE_MAX + 1)
+}  /* namespace DSTORE */
 
-} /* namespace DSTORE */
-
-#endif
+#endif  /* DSTORE_WATCHDOG_FAULT_INJECTION_H */

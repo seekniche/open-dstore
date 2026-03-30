@@ -510,8 +510,11 @@ make run_dstore_tpcctest
 ## 代码规范
 
 - C++11 标准，GCC 7.3 编译
+- 尽量不使用 lambda 表达式，使用普通函数或函数对象代替
+- 故障注入宏（`FAULT_INJECTION_RETURN`、`FAULT_INJECTION_ACTION` 等）在生产代码中必须用 `#ifdef UT ... #endif` 包裹
 - 命名：源文件统一使用 `dstore_` 前缀（如 `dstore_buf_mgr.cpp`、`dstore_btree.cpp`）
 - 函数和变量使用 snake_case 命名风格
 - 头文件：对外公开 API 放在 `interface/`（纯虚类），内部头文件放在 `include/`
-- 支持平台：x86_64（EulerOS 2.5）、aarch64（EulerOS 2.9）
+- Diagnose 接口：放在 `interface/diagnose/`，与 `interface/` 下的对外 API 类似，也是供 server 层调用的接口，主要用于输出统计信息、监控信息、状态信息等诊断数据（如 `HeapDiagnose`、`WatchDogDiagnose`）
+- 支持平台：x86_64（EulerOS 2.5）、aarch64（EulerOS 2.9）。主要运行在 aarch64 平台，编码时优先考虑 ARM 上的性能表现（例如 ARM 的等待唤醒机制比 x86_64 慢，应尽量减少频繁的条件变量/futex 唤醒，优先使用轮询或原子操作等轻量方式）
 - cacheline 对齐（64 字节）用于高频并发访问的数据结构

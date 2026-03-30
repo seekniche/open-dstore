@@ -31,6 +31,7 @@
 #include "index/dstore_btree_perf_unit.h"
 #include "index/dstore_btree_recycle_partition.h"
 #include "index/dstore_btree_page_recycle.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -491,12 +492,32 @@ void BtreeRecycleWorker::BtreeRecycleThreadMain()
     m_recycleThreadStartTime = thrd->GetCore()->startTime;
     m_recycleThreadCore = thrd->GetCore();
 
-    while (!m_stopRecyleThread) {
-        thrd->Sleep();
-        ObjSpaceMgrTask* task = m_btrRecycleTask.load(std::memory_order_acquire);
-        if (task) {
-            m_btreeRecycleResult = task->ExecuteRecycleBtreeTask();
-            m_btrRecycleTask.store(nullptr, std::memory_order_release);
+    {
+        StoragePdb *pdb = g_storageInstance->GetPdb(m_pdbId);
+        WatchDogMgr *watchdogMgr = (pdb != nullptr) ? pdb->GetWatchDogMgr() : nullptr;
+        if (watchdogMgr != nullptr) {
+            m_watchdogHandle = watchdogMgr->Register(
+                WatchDogThreadType::BTREE_RECYCLE, m_workeId, "BtreeRecycler");
+        } else {
+            ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+                ErrMsg("WatchDogMgr is null when registering BtreeRecycler, pdbId=%u.", m_pdbId));
+        }
+
+        while (!m_stopRecyleThread) {
+            WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
+            thrd->Sleep();
+            WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
+            ObjSpaceMgrTask* task = m_btrRecycleTask.load(std::memory_order_acquire);
+            if (task) {
+                m_btreeRecycleResult = task->ExecuteRecycleBtreeTask();
+                m_btrRecycleTask.store(nullptr, std::memory_order_release);
+                WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
+            }
+        }
+
+        if (watchdogMgr != nullptr) {
+            watchdogMgr->Unregister(m_watchdogHandle);
+            m_watchdogHandle = nullptr;
         }
     }
 

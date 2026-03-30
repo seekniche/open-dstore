@@ -293,6 +293,16 @@ struct StorageGUC {
     bool enableTrackIOTiming;
     double candidateSafePercent;
     uint32_t lruScanDepth;
+
+    /* WatchDog parameters */
+    bool enableWatchDog;                               /* Enable WatchDog monitoring, default true */
+    uint32_t watchdogCheckIntervalSec;              /* WatchDog check interval (seconds), default 5 */
+    uint32_t watchdogMasterWriterTimeoutSec;        /* Master Writer timeout (seconds), default 30 */
+    uint32_t watchdogSlaveWriterTimeoutSec;         /* Slave Writer timeout (seconds), default 60 */
+    uint32_t watchdogCheckpointerTimeoutSec;        /* Checkpointer timeout (seconds), default 600 */
+    uint32_t watchdogWalRecycleTimeoutSec;          /* WAL recycle timeout (seconds), default 30 */
+    uint32_t watchdogUndoRecycleTimeoutSec;         /* Undo recycle timeout (seconds), default 120 */
+    uint32_t watchdogBtreeRecycleTimeoutSec;        /* Btree recycle timeout (seconds), default 1800 */
 };
 
 enum class StorageInstanceType : uint8_t {

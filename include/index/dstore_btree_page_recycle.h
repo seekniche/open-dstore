@@ -29,6 +29,7 @@
 
 #include <future>
 #include "index/dstore_btree_page_unlink.h"
+#include "framework/dstore_watchdog.h"
 
 namespace DSTORE {
 
@@ -173,6 +174,8 @@ private:
     /* Index may need access SQL thrd, ERR_LEVEL_FATAL may happen when init SQL thrd, then current thread may be
      * killed, so need create sub-thrd to init SQL thrd to avoid dstore resource leaks. */
     void BtreeRecycleThreadMain();
+
+    WatchDogHandle *m_watchdogHandle = nullptr;
 };
 
 }

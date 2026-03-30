@@ -122,7 +122,7 @@
     "clusterId" : 1,
     "enableQuickStartUp true": "",
     "enableQuickStartUp": true,
-    "startConfigPath": "/home/hbc/codes/dstore_proj/dstore/tests/tpcctest/../../build_script/dstore_conf.json",
+    "startConfigPath": "/home/hbc/codes/dstore_proj/dstore/tests/unittest/ut_config/ut_isoland_start.json",
     "bgDiskWriterSlaveNum" : 1,
     "bgPageWriterSleepMilliSecond" : 2000,
     "walThrottlingSize" : 1048576,
@@ -130,5 +130,13 @@
     "bgWalWriterMinBytes 51200(Byte)": "",
     "bgWalWriterMinBytes": "51200",
     "walEachWriteLenghthLimit 524288(Byte)": "",
-    "walEachWriteLenghthLimit": "524288"
+    "walEachWriteLenghthLimit": "524288",
+    "enableWatchDog": true,
+    "watchdogCheckIntervalSec": 5,
+    "watchdogMasterWriterTimeoutSec": 30,
+    "watchdogSlaveWriterTimeoutSec": 60,
+    "watchdogCheckpointerTimeoutSec": 600,
+    "watchdogWalRecycleTimeoutSec": 30,
+    "watchdogUndoRecycleTimeoutSec": 120,
+    "watchdogBtreeRecycleTimeoutSec": 1800
 }

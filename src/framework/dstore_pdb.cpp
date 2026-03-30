@@ -33,6 +33,7 @@
 #include "transaction/dstore_transaction_mgr.h"
 #include "logical_replication/dstore_logical_replication_mgr.h"
 #include "undo/dstore_undo_mgr.h"
+#include "framework/dstore_watchdog.h"
 #include "wal/dstore_wal.h"
 #include "wal/dstore_wal_write_context.h"
 #include "lock/dstore_lock_mgr.h"
@@ -90,6 +91,7 @@ StoragePdb::StoragePdb(PdbId pdbId)
       m_objSpaceMgr(nullptr),
       m_checkpointMgr(nullptr),
       m_bgPageWriterMgr(nullptr),
+      m_watchdogMgr(nullptr),
       m_recycleUndoThread(nullptr),
       m_asyncRecoverUndoThread(nullptr),
       m_checkpointThread(nullptr),
@@ -146,6 +148,7 @@ StoragePdb::StoragePdb(PdbId pdbId, const char* pdbUuid)
       m_objSpaceMgr(nullptr),
       m_checkpointMgr(nullptr),
       m_bgPageWriterMgr(nullptr),
+      m_watchdogMgr(nullptr),
       m_recycleUndoThread(nullptr),
       m_asyncRecoverUndoThread(nullptr),
       m_checkpointThread(nullptr),
@@ -404,6 +407,7 @@ RetStatus StoragePdb::InitPdb(bool initCsn)
         (void)g_storageInstance->StorageInstance::InitCsnMgr();
     }
     InitTableSpaceMgr();
+    InitWatchDogMgr();
     InitWalMgr();
     InitLogicalReplicaMgr();
     InitCheckpointMgr();
@@ -441,6 +445,7 @@ void StoragePdb::DestroyMgr()
     DestroyCheckpointMgr();
     DestroyControlFile();
     DestroyObjSpaceMgr();
+    DestroyWatchDogMgr();
 }
 
 RetStatus StoragePdb::ResetPdb(const char *vfsName, bool dropData)
@@ -562,6 +567,7 @@ RetStatus StoragePdb::OpenPdb(void *pdbInfoData)
     }
     
     InitTableSpaceMgr();
+    InitWatchDogMgr();
     InitWalMgr();
     InitLogicalReplicaMgr();
     InitCheckpointMgr();
@@ -2136,6 +2142,31 @@ void StoragePdb::DestroyCheckpointMgr()
     m_checkpointMgr = nullptr;
 }
 
+void StoragePdb::InitWatchDogMgr()
+{
+    if (m_watchdogMgr != nullptr) {
+        return;
+    }
+    const StorageGUC *guc = g_storageInstance->GetGuc();
+    if (guc != nullptr && !guc->enableWatchDog) {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDog: disabled by GUC enableWatchDog, pdbId=%u.", m_pdbId));
+        return;
+    }
+    m_watchdogMgr = new WatchDogMgr();
+    (void)m_watchdogMgr->Init(m_pdbId);
+    m_watchdogMgr->StartThread();
+}
+
+void StoragePdb::DestroyWatchDogMgr()
+{
+    if (m_watchdogMgr != nullptr) {
+        m_watchdogMgr->Destroy();
+        delete m_watchdogMgr;
+        m_watchdogMgr = nullptr;
+    }
+}
+
 void StoragePdb::StartBgThread()
 {
     if (g_defaultPdbId == PDB_ROOT_ID && IsTemplate(GetPdbId())) {
@@ -2341,9 +2372,11 @@ void StoragePdb::RecycleUndo()
     static constexpr long sleepIntervalInMs = 50;
     while (!m_stopBgThread) {
         /* sleep first */
+        WatchDogMgr::SetRunState(m_undoRecycleWdHandle, ThreadRunState::SLEEPING);
         for (int i = 0; i < sleepIntervalInMs && !m_stopBgThread; i++) {
             std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long>(STORAGE_USECS_PER_MSEC)));
         }
+        WatchDogMgr::SetRunState(m_undoRecycleWdHandle, ThreadRunState::RUNNING);
         /* check for thread exit after sleep */
         if (m_stopBgThread) {
             break;
@@ -2353,6 +2386,7 @@ void StoragePdb::RecycleUndo()
         recycleMinCsn = g_storageInstance->GetCsnMgr()->GetRecycleCsnMin(m_pdbId);
         /* Now do the real recycle */
         m_undoMgr->Recycle(recycleMinCsn);
+        WatchDogMgr::TouchHeartbeat(m_undoRecycleWdHandle);
     }
 }
 
@@ -2367,8 +2401,20 @@ void StoragePdb::RecycleUndoThreadMain()
         }
         ErrLog(DSTORE_LOG, MODULE_FRAMEWORK, ErrMsg("pdb %s is in backup restore.", m_pdbName));
     }
+    if (m_watchdogMgr != nullptr) {
+        m_undoRecycleWdHandle = m_watchdogMgr->Register(
+            WatchDogThreadType::UNDO_RECYCLE, 0, "UndoRecycler");
+        WatchDogMgr::SetRunState(m_undoRecycleWdHandle, ThreadRunState::RUNNING);
+    } else {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDogMgr is null when registering UndoRecycler, pdbId=%u.", m_pdbId));
+    }
     ErrLog(DSTORE_LOG, MODULE_FRAMEWORK, ErrMsg("UndoRecycler m_pdbId:%u start.", m_pdbId));
     RecycleUndo();
+    if (m_watchdogMgr != nullptr) {
+        m_watchdogMgr->Unregister(m_undoRecycleWdHandle);
+        m_undoRecycleWdHandle = nullptr;
+    }
     ErrLog(DSTORE_LOG, MODULE_FRAMEWORK, ErrMsg("UndoRecycler m_pdbId:%u stop.", m_pdbId));
     UnregisterThread();
 }

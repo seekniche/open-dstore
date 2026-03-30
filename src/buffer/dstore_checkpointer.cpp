@@ -20,6 +20,7 @@
 #include "port/dstore_port.h"
 #include "lock/dstore_lwlock.h"
 #include "framework/dstore_thread.h"
+#include "framework/dstore_watchdog.h"
 #include "buffer/dstore_buf_mgr.h"
 #include "buffer/dstore_bg_page_writer_mgr.h"
 #include "buffer/dstore_bg_disk_page_writer.h"
@@ -30,6 +31,17 @@ void CheckpointMgr::CheckpointerMain()
 {
     AutoMemCxtSwitch autoSwitch{m_checkpointContext};
 
+    StoragePdb *pdbForWd = g_storageInstance->GetPdb(m_pdbId);
+    WatchDogMgr *watchdogMgr = (pdbForWd != nullptr) ? pdbForWd->GetWatchDogMgr() : nullptr;
+    if (watchdogMgr != nullptr) {
+        m_watchdogHandle = watchdogMgr->Register(
+            WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
+    } else {
+        ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
+            ErrMsg("WatchDogMgr is null when registering Checkpointer, pdbId=%u.", m_pdbId));
+    }
+
     while (true) {
 LOOP:
         Timestamp now;
@@ -37,6 +49,10 @@ LOOP:
 
         /* exit when m_shutdownRequested is set */
         if (m_shutdownRequested.load(std::memory_order_acquire)) {
+            if (watchdogMgr != nullptr) {
+                watchdogMgr->Unregister(m_watchdogHandle);
+                m_watchdogHandle = nullptr;
+            }
             break;
         }
         /*
@@ -106,14 +122,18 @@ LOOP:
             continue;
         }
 
+        WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
+
         /* step3: check if there are dropping walstreams needs to be delete */
         walStreamMgr->DeleteDroppedWalStream();
         /* step4: wait enough time but break if requested to stop */
         /* WaitLatch */
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
         int waitTimeInMs = 1000;
         for (int i = 0; i < waitTimeInMs && !m_shutdownRequested; i++) {
             GaussUsleep(STORAGE_USECS_PER_MSEC);
         }
+        WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
     }
 }
 

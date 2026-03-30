@@ -230,6 +230,14 @@ void DSTORETEST::SetUpTestCase()
     m_guc.rnSleepTimeoutSeconds = 1;
     m_guc.enableRemoteCrConstruction = false;
     m_guc.walKeepTimeAfterRecovery = 0;
+    m_guc.enableWatchDog = true;
+    m_guc.watchdogCheckIntervalSec = 5;
+    m_guc.watchdogMasterWriterTimeoutSec = 30;
+    m_guc.watchdogSlaveWriterTimeoutSec = 60;
+    m_guc.watchdogCheckpointerTimeoutSec = 600;
+    m_guc.watchdogWalRecycleTimeoutSec = 30;
+    m_guc.watchdogUndoRecycleTimeoutSec = 120;
+    m_guc.watchdogBtreeRecycleTimeoutSec = 1800;
     rc = strcpy_s(m_guc.tenantConfig->tenantName, DSTORE_TENANT_NAME_MAX_LEN, "tenant1");
     storage_securec_check(rc, "\0", "\0");
     m_guc.tenantConfig->storeSpaceCnt = 1;
@@ -491,6 +499,14 @@ void DSTOREParamTest<T>::SetUpTestCase()
     m_guc.enableRemoteCrConstruction = false;
     m_guc.walKeepTimeAfterRecovery = 0;
     m_guc.enableStmtTrack = false;
+    m_guc.enableWatchDog = true;
+    m_guc.watchdogCheckIntervalSec = 5;
+    m_guc.watchdogMasterWriterTimeoutSec = 30;
+    m_guc.watchdogSlaveWriterTimeoutSec = 60;
+    m_guc.watchdogCheckpointerTimeoutSec = 600;
+    m_guc.watchdogWalRecycleTimeoutSec = 30;
+    m_guc.watchdogUndoRecycleTimeoutSec = 120;
+    m_guc.watchdogBtreeRecycleTimeoutSec = 1800;
 
     char m_tenantConfigFilePath[MAXPGPATH];
     /* Get tenant config file. */
