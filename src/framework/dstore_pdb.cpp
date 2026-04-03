@@ -2385,6 +2385,7 @@ void StoragePdb::RecycleUndo()
         /* If enable flashback need to consider the flashback csnmin */
         recycleMinCsn = g_storageInstance->GetCsnMgr()->GetRecycleCsnMin(m_pdbId);
         /* Now do the real recycle */
+        WatchDogMgr::ReportProgress(m_undoRecycleWdHandle, "recycling undo zones");
         m_undoMgr->Recycle(recycleMinCsn);
         WatchDogMgr::TouchHeartbeat(m_undoRecycleWdHandle);
     }

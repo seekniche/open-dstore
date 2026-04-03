@@ -44,20 +44,30 @@ enum class WatchDogThreadType : uint8 {
     WATCHDOG_THREAD_TYPE_COUNT
 };
 
+/* 线程自报状态 —— 只由被监控线程自身写入 */
 enum class ThreadRunState : uint8 {
     NOT_STARTED = 0,
     RUNNING,
     SLEEPING,
-    STUCK,
     STOPPED
 };
 
+/* WatchDog 推断的健康状态 —— 只由 WatchDog 线程写入 */
+enum class ThreadHealthState : uint8 {
+    HEALTHY = 0,
+    TIMEOUT
+};
+
+static constexpr uint32 WATCHDOG_PROGRESS_MSG_LEN = 128;
+
 struct WatchDogHandle {
     std::atomic<uint64> lastHeartbeatUs{0};
-    std::atomic<ThreadRunState> runState{ThreadRunState::NOT_STARTED};
+    std::atomic<ThreadRunState> runState{ThreadRunState::NOT_STARTED};       /* 线程自报 */
+    std::atomic<ThreadHealthState> healthState{ThreadHealthState::HEALTHY};  /* WatchDog 推断 */
     WatchDogThreadType threadType = WatchDogThreadType::WATCHDOG_THREAD_TYPE_COUNT;
     uint32 threadIndex = 0;
     char threadName[64] = {'\0'};
+    char progressMsg[WATCHDOG_PROGRESS_MSG_LEN] = {'\0'};  /* 线程自报的当前进度描述 */
     std::atomic<bool> registered{false};
 };
 
@@ -84,6 +94,8 @@ public:
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         hb->lastHeartbeatUs.store(nowUs, std::memory_order_relaxed);
+        /* 心跳更新时自动恢复健康状态 */
+        hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
     }
 
     static inline void SetRunState(WatchDogHandle *hb, ThreadRunState state)
@@ -92,6 +104,9 @@ public:
             hb->runState.store(state, std::memory_order_relaxed);
         }
     }
+
+    /* 长任务中间进度汇报：更新心跳 + 记录当前进度描述 */
+    static void ReportProgress(WatchDogHandle *hb, const char *msg);
 
     void WatchDogThreadMain();
 

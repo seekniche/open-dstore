@@ -126,8 +126,8 @@ TEST_F(WatchDogMgrTest, SetRunState_Basic_level0)
     WatchDogMgr::SetRunState(hb, ThreadRunState::SLEEPING);
     EXPECT_EQ(ThreadRunState::SLEEPING, hb->runState.load(std::memory_order_relaxed));
 
-    WatchDogMgr::SetRunState(hb, ThreadRunState::STUCK);
-    EXPECT_EQ(ThreadRunState::STUCK, hb->runState.load(std::memory_order_relaxed));
+    WatchDogMgr::SetRunState(hb, ThreadRunState::STOPPED);
+    EXPECT_EQ(ThreadRunState::STOPPED, hb->runState.load(std::memory_order_relaxed));
 }
 
 TEST_F(WatchDogMgrTest, SetRunState_Nullptr_level0)
@@ -234,7 +234,7 @@ TEST_F(WatchDogMgrTest, GetHeartbeatsByType_NoMatch_level0)
 /* ========================================================================
  * CheckAllHeartbeats tests
  * ======================================================================== */
-TEST_F(WatchDogMgrTest, CheckHeartbeats_DetectsStuck_level0)
+TEST_F(WatchDogMgrTest, CheckHeartbeats_DetectsTimeout_level0)
 {
     WatchDogHandle *hb = m_mgr->Register(
         WatchDogThreadType::BG_PAGE_MASTER_WRITER, 0, "MasterWriter");
@@ -244,7 +244,10 @@ TEST_F(WatchDogMgrTest, CheckHeartbeats_DetectsStuck_level0)
 
     m_mgr->CheckAllHeartbeats();
 
-    EXPECT_EQ(ThreadRunState::STUCK, hb->runState.load(std::memory_order_relaxed));
+    /* runState 不被 WatchDog 修改，仍然是 RUNNING */
+    EXPECT_EQ(ThreadRunState::RUNNING, hb->runState.load(std::memory_order_relaxed));
+    /* healthState 被 WatchDog 设为 TIMEOUT */
+    EXPECT_EQ(ThreadHealthState::TIMEOUT, hb->healthState.load(std::memory_order_relaxed));
 }
 
 TEST_F(WatchDogMgrTest, CheckHeartbeats_SkipsSleeping_level0)
@@ -258,9 +261,10 @@ TEST_F(WatchDogMgrTest, CheckHeartbeats_SkipsSleeping_level0)
     m_mgr->CheckAllHeartbeats();
 
     EXPECT_EQ(ThreadRunState::SLEEPING, hb->runState.load(std::memory_order_relaxed));
+    EXPECT_EQ(ThreadHealthState::HEALTHY, hb->healthState.load(std::memory_order_relaxed));
 }
 
-TEST_F(WatchDogMgrTest, CheckHeartbeats_HealthyThreadNotStuck_level0)
+TEST_F(WatchDogMgrTest, CheckHeartbeats_HealthyThreadNoTimeout_level0)
 {
     WatchDogHandle *hb = m_mgr->Register(
         WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
@@ -271,6 +275,34 @@ TEST_F(WatchDogMgrTest, CheckHeartbeats_HealthyThreadNotStuck_level0)
     m_mgr->CheckAllHeartbeats();
 
     EXPECT_EQ(ThreadRunState::RUNNING, hb->runState.load(std::memory_order_relaxed));
+    EXPECT_EQ(ThreadHealthState::HEALTHY, hb->healthState.load(std::memory_order_relaxed));
+}
+
+TEST_F(WatchDogMgrTest, ReportProgress_Basic_level0)
+{
+    WatchDogHandle *hb = m_mgr->Register(
+        WatchDogThreadType::CHECKPOINTER, 0, "Checkpointer");
+    ASSERT_NE(nullptr, hb);
+    WatchDogMgr::SetRunState(hb, ThreadRunState::RUNNING);
+
+    /* 模拟超时 */
+    hb->lastHeartbeatUs.store(0, std::memory_order_relaxed);
+    m_mgr->CheckAllHeartbeats();
+    EXPECT_EQ(ThreadHealthState::TIMEOUT, hb->healthState.load(std::memory_order_relaxed));
+
+    /* ReportProgress 刷新心跳并恢复健康 */
+    WatchDogMgr::ReportProgress(hb, "flushing dirty pages 50%");
+    EXPECT_EQ(ThreadHealthState::HEALTHY, hb->healthState.load(std::memory_order_relaxed));
+    EXPECT_STREQ("flushing dirty pages 50%", hb->progressMsg);
+
+    /* 再次检查不超时 */
+    m_mgr->CheckAllHeartbeats();
+    EXPECT_EQ(ThreadHealthState::HEALTHY, hb->healthState.load(std::memory_order_relaxed));
+}
+
+TEST_F(WatchDogMgrTest, ReportProgress_Nullptr_level0)
+{
+    WatchDogMgr::ReportProgress(nullptr, "should not crash");
 }
 
 /* ========================================================================

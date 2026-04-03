@@ -92,6 +92,7 @@ LOOP:
 
             /* get the checkpoint request flag, and advance wal start count */
             flag = walCheckpointInfo->checkpointStreamRequest.StartCheckpoint();
+            WatchDogMgr::ReportProgress(m_watchdogHandle, "checkpointing walStream");
             if (STORAGE_FUNC_FAIL(CheckpointOneWalStream(walId, flag, &isPerformed))) {
                 goto LOOP;
             }
@@ -125,6 +126,7 @@ LOOP:
         WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
 
         /* step3: check if there are dropping walstreams needs to be delete */
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "cleaning dropped walStreams");
         walStreamMgr->DeleteDroppedWalStream();
         /* step4: wait enough time but break if requested to stop */
         /* WaitLatch */

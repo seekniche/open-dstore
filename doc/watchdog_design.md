@@ -65,23 +65,32 @@ enum class WatchDogThreadType : uint8 {
     WATCHDOG_THREAD_TYPE_COUNT   // 哨兵值，用于数组大小
 };
 
-// 线程运行状态
+// 线程自报状态 —— 只由被监控线程自身写入
 enum class ThreadRunState : uint8 {
     NOT_STARTED = 0,    // 线程未启动
     RUNNING,            // 正常运行中
     SLEEPING,           // 正常休眠中（等待任务/定时唤醒）
-    STUCK,              // 疑似卡死（心跳超时）
     STOPPED             // 已停止
 };
 
+// WatchDog 推断的健康状态 —— 只由 WatchDog 线程写入
+enum class ThreadHealthState : uint8 {
+    HEALTHY = 0,        // 心跳正常
+    TIMEOUT             // 心跳超时，疑似卡死
+};
+
+static constexpr uint32 WATCHDOG_PROGRESS_MSG_LEN = 128;
+
 // 单个线程的心跳信息
 struct WatchDogHandle {
-    std::atomic<uint64> lastHeartbeatUs;         // 上次心跳时间（微秒，steady_clock）
-    std::atomic<ThreadRunState> runState;         // 当前运行状态
-    WatchDogThreadType threadType;                // 线程类型
-    uint32 threadIndex;                           // 同类型线程的索引（如 slave writer 0/1/2...）
-    char threadName[64];                           // 线程名称（固定数组，Register 时 strncpy 拷贝）
-    std::atomic<bool> registered;                 // 是否已注册（用于遍历时跳过空槽位）
+    std::atomic<uint64> lastHeartbeatUs{0};                                     // 上次心跳时间（微秒，steady_clock）
+    std::atomic<ThreadRunState> runState{ThreadRunState::NOT_STARTED};          // 线程自报状态
+    std::atomic<ThreadHealthState> healthState{ThreadHealthState::HEALTHY};     // WatchDog 推断的健康状态
+    WatchDogThreadType threadType = WatchDogThreadType::WATCHDOG_THREAD_TYPE_COUNT;
+    uint32 threadIndex = 0;                                                     // 同类型线程的索引
+    char threadName[64] = {'\0'};                                               // 线程名称
+    char progressMsg[WATCHDOG_PROGRESS_MSG_LEN] = {'\0'};                      // 线程自报的当前进度描述
+    std::atomic<bool> registered{false};                                        // 是否已注册
 };
 ```
 
@@ -114,11 +123,17 @@ public:
     void Unregister(WatchDogHandle *heartbeat);
 
     // 心跳更新（被监控线程在主循环中调用）
-    // 内联实现，尽量轻量
+    // 内联实现，尽量轻量；同时自动恢复 healthState 为 HEALTHY
     static inline void TouchHeartbeat(WatchDogHandle *hb);
 
-    // 设置线程状态（可选，用于区分 RUNNING/SLEEPING）
+    // 设置线程自报状态（可选，用于区分 RUNNING/SLEEPING）
+    // 注意：只由被监控线程自身调用，WatchDog 不会修改 runState
     static inline void SetRunState(WatchDogHandle *hb, ThreadRunState state);
+
+    // 长任务中间进度汇报：更新心跳 + 记录当前进度描述
+    // 适用于单次任务时间较长的线程（Checkpointer、Undo Recycle、B-tree Recycle 等）
+    // 在任务内部关键进度点调用，避免长时间正常推进的工作被误判为卡死
+    static void ReportProgress(WatchDogHandle *hb, const char *msg);
 
     // === WatchDog 线程内部方法 ===
 
@@ -173,16 +188,33 @@ inline void WatchDogMgr::TouchHeartbeat(WatchDogHandle *hb)
     if (hb == nullptr) {
         return;
     }
-    auto now = std::chrono::steady_clock::now();
-    uint64 nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
-        now.time_since_epoch()).count();
+    uint64 nowUs = static_cast<uint64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
     hb->lastHeartbeatUs.store(nowUs, std::memory_order_relaxed);
+    // 心跳更新时自动恢复健康状态
+    hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
 }
 
 inline void WatchDogMgr::SetRunState(WatchDogHandle *hb, ThreadRunState state)
 {
     if (hb != nullptr) {
         hb->runState.store(state, std::memory_order_relaxed);
+    }
+}
+
+void WatchDogMgr::ReportProgress(WatchDogHandle *hb, const char *msg)
+{
+    if (hb == nullptr) {
+        return;
+    }
+    TouchHeartbeat(hb);
+    if (msg != nullptr) {
+        error_t rc = strncpy_s(hb->progressMsg, sizeof(hb->progressMsg),
+                               msg, sizeof(hb->progressMsg) - 1);
+        storage_securec_check(rc, "\0", "\0");
+    } else {
+        hb->progressMsg[0] = '\0';
     }
 }
 ```
@@ -237,6 +269,8 @@ void BgDiskPageSlaveWriter::Run()
 
 #### 3.4.3 Checkpointer（`CheckpointMgr::CheckpointerMain()`）
 
+Checkpointer 单次 checkpoint 可能持续很长时间（扫描所有 WAL stream、刷脏页等），如果只在大循环入口更新一次心跳，正常推进的工作也会被误判为卡死。因此需要在任务内部关键进度点调用 `ReportProgress` 汇报进度：
+
 ```cpp
 void CheckpointMgr::CheckpointerMain()
 {
@@ -247,7 +281,17 @@ void CheckpointMgr::CheckpointerMain()
         if (m_shutdownRequested) { break; }
 
         WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
-        // ... 遍历 WAL stream 做 checkpoint ...
+
+        // === checkpoint 内部关键进度点汇报 ===
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "scanning WAL streams");
+        // ... 扫描 WAL stream ...
+
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "flushing dirty pages");
+        // ... 刷脏页 ...
+
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "updating control file");
+        // ... 更新控制文件 ...
+
         WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
 
         WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::SLEEPING);
@@ -283,6 +327,8 @@ void WalFileManager::RecycleWalFileWorkerMain(bool isDropping)
 
 #### 3.4.5 Undo 回收（`StoragePdb::RecycleUndoThreadMain()`）
 
+Undo 回收涉及较多页面扫描，单次任务时间可能较长。在 RecycleUndo() 内部关键步骤调用 `ReportProgress` 避免误判：
+
 ```cpp
 void StoragePdb::RecycleUndoThreadMain()
 {
@@ -290,7 +336,8 @@ void StoragePdb::RecycleUndoThreadMain()
         WatchDogThreadType::UNDO_RECYCLE, 0, "UndoRecycler");
 
     // ... 等待备份恢复完成 ...
-    // RecycleUndo() 内部循环中需要埋入心跳
+    // RecycleUndo() 内部循环中需要在关键进度点调用 ReportProgress
+    // 例如：WatchDogMgr::ReportProgress(m_undoRecycleWdHandle, "scanning zone N");
     RecycleUndo();
 
     watchdogMgr->Unregister(m_undoRecycleWdHandle);
@@ -298,6 +345,8 @@ void StoragePdb::RecycleUndoThreadMain()
 ```
 
 #### 3.4.6 B-tree Recycle（`BtreeRecycleWorker::BtreeRecycleThreadMain()`）
+
+B-tree 回收任务本身可能较慢（页面 unlink、批量回收等），在任务内部关键步骤调用 `ReportProgress` 避免误判：
 
 ```cpp
 void BtreeRecycleWorker::BtreeRecycleThreadMain()
@@ -312,7 +361,13 @@ void BtreeRecycleWorker::BtreeRecycleThreadMain()
         if (m_stopRecyleThread) { break; }
 
         WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
-        // ... 执行回收任务 ...
+        // === 回收任务内部关键进度点汇报 ===
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "unlinking empty pages");
+        // ... 执行页面 unlink ...
+
+        WatchDogMgr::ReportProgress(m_watchdogHandle, "batch recycling pages");
+        // ... 执行批量回收 ...
+
         WatchDogMgr::TouchHeartbeat(m_watchdogHandle);
     }
 
@@ -384,7 +439,11 @@ uint64 WatchDogMgr::GetTimeoutUsFromGuc(WatchDogThreadType type) const
 | `watchdogUndoRecycleTimeoutSec` | 120 | [30, 600] | 涉及较多页面扫描 |
 | `watchdogBtreeRecycleTimeoutSec` | 1800 | [60, 7200] | 任务本身可能较慢 |
 
-**注意**：线程处于 `SLEEPING` 状态时，WatchDog 不检测超时（因为等待任务/定时唤醒是正常行为）。只有 `RUNNING` 状态下心跳超时才告警。
+**状态写入权责分离：**
+- `ThreadRunState`（NOT_STARTED/RUNNING/SLEEPING/STOPPED）由被监控线程自身写入，WatchDog **不会**修改
+- `ThreadHealthState`（HEALTHY/TIMEOUT）由 WatchDog 线程写入，被监控线程通过 `TouchHeartbeat` / `ReportProgress` 间接恢复为 HEALTHY
+
+**注意**：线程处于 `SLEEPING` 状态时，WatchDog 不检测超时（因为等待任务/定时唤醒是正常行为），并将 healthState 恢复为 HEALTHY。只有 `RUNNING` 状态下心跳超时才设置 TIMEOUT 并告警。告警仅在首次检测到超时时打印（HEALTHY → TIMEOUT），避免重复告警。
 
 ### 3.6 WatchDog 线程主循环
 
@@ -418,16 +477,17 @@ void WatchDogMgr::CheckAllHeartbeats()
     uint64 nowUs = GetSteadyClockUs();
     uint32 count = m_registeredCount.load(std::memory_order_acquire);
 
-    for (uint32 i = 0; i < count; i++) {
+    for (uint32 i = 0; i < count && i < MAX_WATCHED_THREADS; i++) {
         WatchDogHandle *hb = &m_heartbeats[i];
 
-        if (!hb->registered.load(std::memory_order_relaxed)) {
+        if (!hb->registered.load(std::memory_order_acquire)) {
             continue;
         }
 
-        // 只检查 RUNNING 状态的线程
         ThreadRunState state = hb->runState.load(std::memory_order_relaxed);
         if (state != ThreadRunState::RUNNING) {
+            // 非 RUNNING 状态(SLEEPING/NOT_STARTED/STOPPED)恢复健康
+            hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
             continue;
         }
 
@@ -436,13 +496,18 @@ void WatchDogMgr::CheckAllHeartbeats()
         uint64 timeoutUs = GetTimeoutUsFromGuc(hb->threadType);
 
         if (elapsed > timeoutUs) {
-            ErrLog(DSTORE_ERROR, MODULE_WATCHDOG,
-                ErrMsg("WatchDog: thread '%s' (type=%d, index=%u) appears STUCK. "
-                       "Last heartbeat was %lu us ago (timeout=%lu us).",
-                       hb->threadName, (int)hb->threadType, hb->threadIndex,
-                       elapsed, timeoutUs));
-
-            hb->runState.store(ThreadRunState::STUCK, std::memory_order_relaxed);
+            // 仅在首次检测到超时时打印告警（HEALTHY → TIMEOUT）
+            ThreadHealthState prevHealth = hb->healthState.load(std::memory_order_relaxed);
+            if (prevHealth != ThreadHealthState::TIMEOUT) {
+                ErrLog(DSTORE_ERROR, MODULE_WATCHDOG,
+                    ErrMsg("WatchDog TIMEOUT DETECTED: thread '%s' (type=%d, index=%u) "
+                           "no heartbeat for %lu us (timeout=%lu us), lastProgress='%s', pdbId=%u.",
+                           hb->threadName, static_cast<int>(hb->threadType), hb->threadIndex,
+                           elapsed, timeoutUs, hb->progressMsg, m_pdbId));
+            }
+            hb->healthState.store(ThreadHealthState::TIMEOUT, std::memory_order_relaxed);
+        } else {
+            hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
         }
     }
 }
@@ -467,11 +532,13 @@ struct WatchDogThreadStatus : public DiagnoseItem {
     char threadName[64];                // 线程名称
     WatchDogThreadType threadType;      // 线程类型
     uint32_t threadIndex;               // 同类型线程索引
-    ThreadRunState runState;            // 当前状态（RUNNING/SLEEPING/STUCK/...）
-    bool isTimeout;                     // 是否超时
+    ThreadRunState runState;            // 线程自报状态（RUNNING/SLEEPING/...）
+    ThreadHealthState healthState;      // WatchDog 推断的健康状态（HEALTHY/TIMEOUT）
+    bool isTimeout;                     // 是否超时（等同于 healthState == TIMEOUT）
     uint64_t lastHeartbeatUs;           // 上次心跳时间戳（微秒，steady_clock）
     uint64_t elapsedUs;                 // 距上次心跳已过时间（微秒）
     uint64_t timeoutThresholdUs;        // 超时阈值（微秒，从 GUC 读取）
+    char progressMsg[WATCHDOG_PROGRESS_MSG_LEN];  // 线程最后汇报的进度描述
 };
 
 class WatchDogDiagnose {
@@ -548,15 +615,17 @@ RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId,
         errno_t rc = strncpy_s(status.threadName, sizeof(status.threadName),
                                hb.threadName, sizeof(status.threadName) - 1);
         storage_securec_check(rc, "", "");
+        rc = strncpy_s(status.progressMsg, sizeof(status.progressMsg),
+                       hb.progressMsg, sizeof(status.progressMsg) - 1);
+        storage_securec_check(rc, "", "");
         status.threadType = hb.threadType;
         status.threadIndex = hb.threadIndex;
         status.runState = hb.runState.load(std::memory_order_relaxed);
+        status.healthState = hb.healthState.load(std::memory_order_relaxed);
         status.lastHeartbeatUs = hb.lastHeartbeatUs.load(std::memory_order_relaxed);
         status.elapsedUs = nowUs - status.lastHeartbeatUs;
         status.timeoutThresholdUs = mgr->GetTimeoutUsFromGuc(hb.threadType);
-        status.isTimeout = (status.runState == ThreadRunState::RUNNING ||
-                            status.runState == ThreadRunState::STUCK) &&
-                           (status.elapsedUs > status.timeoutThresholdUs);
+        status.isTimeout = (status.healthState == ThreadHealthState::TIMEOUT);
     }
 
     *outArray = result;
@@ -580,25 +649,25 @@ void WatchDogDiagnose::FreeThreadStatusArray(WatchDogThreadStatus *arr)
 ================== WatchDog Thread Status ==================
 PDB: 3
 
-Thread Name          Type                 Index  State      Timeout?  Elapsed(s)  Threshold(s)
---------------------+--------------------+------+----------+---------+-----------+-------------
-MasterWriter         BG_PAGE_MASTER       0      RUNNING    NO        0.5         30
-SlaveWriter          BG_PAGE_SLAVE        0      SLEEPING   NO        2.1         60
-SlaveWriter          BG_PAGE_SLAVE        1      RUNNING    NO        0.3         60
-Checkpointer         CHECKPOINTER         0      RUNNING    NO        1.2         600
-WalRecycler          WAL_FILE_RECYCLE     0      SLEEPING   NO        5.0         30
-UndoRecycler         UNDO_RECYCLE         0      RUNNING    NO        3.4         120
-BtreeRecycler        BTREE_RECYCLE        0      SLEEPING   NO        120.5       1800
+Thread Name          Type             Index  RunState   Health   Elapsed(s)  Threshold(s) Progress
+--------------------+----------------+------+----------+--------+-----------+-------------+--------
+MasterWriter         BG_PAGE_MASTER   0      RUNNING    HEALTHY  0.5         30.0
+SlaveWriter          BG_PAGE_SLAVE    0      SLEEPING   HEALTHY  2.1         60.0
+SlaveWriter          BG_PAGE_SLAVE    1      RUNNING    HEALTHY  0.3         60.0
+Checkpointer         CHECKPOINTER     0      RUNNING    HEALTHY  1.2         600.0        flushing dirty pages
+WalRecycler          WAL_FILE_RECYCLE 0      SLEEPING   HEALTHY  5.0         30.0
+UndoRecycler         UNDO_RECYCLE     0      RUNNING    HEALTHY  3.4         120.0        scanning zone 5
+BtreeRecycler        BTREE_RECYCLE    0      SLEEPING   HEALTHY  120.5       1800.0
 
-Stuck Threads: 0
+Timeout Threads: 0
 ================================================================
 ```
 
-告警时的 ERROR 日志：
+告警时的 ERROR 日志（仅在首次 HEALTHY → TIMEOUT 时打印，不重复告警）：
 
 ```
-[ERROR] WatchDog: thread 'MasterWriter' (type=BG_PAGE_MASTER_WRITER, index=0) appears STUCK.
-        Last heartbeat was 45000000 us ago (timeout=30000000 us).
+[ERROR] WatchDog TIMEOUT DETECTED: thread 'MasterWriter' (type=0, index=0)
+        no heartbeat for 45000000 us (timeout=30000000 us), lastProgress='', pdbId=3.
 ```
 
 ### 3.8 Diagnose 接口调用方式
@@ -871,29 +940,33 @@ TEST_F(WatchDogTestBase, Register_FaultInjection)
 }
 ```
 
-#### 6.4.3 TouchHeartbeat / SetRunState
+#### 6.4.3 TouchHeartbeat / SetRunState / ReportProgress
 
 | 用例 | 覆盖点 |
 |------|--------|
 | `TouchHeartbeat_UpdatesTimestamp` | 调用后 lastHeartbeatUs 更新为当前时间附近 |
+| `TouchHeartbeat_ResetsHealthState` | 调用后 healthState 恢复为 HEALTHY |
 | `TouchHeartbeat_Nullptr` | 传 nullptr，不崩溃（分支覆盖） |
 | `TouchHeartbeat_MultipleCalls` | 多次调用，时间戳递增 |
 | `SetRunState_AllStates` | 遍历所有 ThreadRunState 枚举值，逐一设置并验证 |
 | `SetRunState_Nullptr` | 传 nullptr，不崩溃（分支覆盖） |
+| `ReportProgress_Basic` | 调用后更新心跳 + progressMsg 正确写入 |
+| `ReportProgress_Nullptr` | msg 传 nullptr，progressMsg 清空，不崩溃 |
+| `ReportProgress_HandleNullptr` | hb 传 nullptr，不崩溃 |
 
 #### 6.4.4 CheckAllHeartbeats（核心检测逻辑）
 
 | 用例 | 覆盖点 |
 |------|--------|
 | `Check_NoRegisteredThreads` | 空列表，无告警 |
-| `Check_AllThreadsHealthy` | 所有线程心跳正常，无 STUCK |
-| `Check_RunningThreadTimeout` | RUNNING 线程超时 → 状态变为 STUCK + ERROR 日志 |
+| `Check_AllThreadsHealthy` | 所有线程心跳正常，healthState == HEALTHY |
+| `Check_RunningThreadTimeout` | RUNNING 线程超时 → healthState 变为 TIMEOUT + ERROR 日志（runState 不变） |
 | `Check_SleepingThreadNotChecked` | SLEEPING 线程即使心跳过期也不告警（关键分支） |
 | `Check_NotStartedThreadNotChecked` | NOT_STARTED 线程不检查 |
 | `Check_StoppedThreadNotChecked` | STOPPED 线程不检查 |
-| `Check_StuckThreadAlreadyStuck` | 已经 STUCK 的线程不重复告警（STUCK != RUNNING，跳过检查） |
+| `Check_AlreadyTimeout` | 已经 TIMEOUT 的线程不重复打印告警（仅 HEALTHY → TIMEOUT 时打印） |
 | `Check_MixedStates` | 混合状态：部分 RUNNING 正常、部分超时、部分 SLEEPING |
-| `Check_ThreadRecoverFromStuck` | 线程从 STUCK 恢复后（更新心跳+SetRunState RUNNING），不再告警 |
+| `Check_ThreadRecoverFromTimeout` | 线程 TouchHeartbeat 后 healthState 恢复为 HEALTHY，不再告警 |
 | `Check_UnregisteredSlotSkipped` | 注销后的槽位被跳过（registered == false 分支） |
 
 #### 6.4.5 GetTimeoutUsFromGuc
@@ -997,7 +1070,7 @@ TEST_F(WatchDogDiagnoseTest, GetAll_NoPdb_FaultInjection)
 |------|--------|---------|
 | `Summary_Empty` | 无线程，返回空表头 | - |
 | `Summary_Normal` | 有线程，包含正确表头和数据行 | - |
-| `Summary_ContainsStuckCount` | 含 STUCK 线程，"Stuck Threads: N" 正确 | - |
+| `Summary_ContainsTimeoutCount` | 含 TIMEOUT 线程，"Timeout Threads: N" 正确 | - |
 | `Summary_NoPdb` | 无效 pdbId，返回 nullptr | - |
 | `Summary_NoPdb_FaultInjection` | 故障注入 GetPdb 返回 nullptr | `FAULT_INJECTION_ACTIVE(DstoreWatchDogFI::GET_PDB_FAIL, FI_GLOBAL)` |
 
@@ -1049,7 +1122,8 @@ FAULT_INJECTION_INACTIVE(DstoreWatchDogFI::REGISTER_FAIL, FI_GLOBAL);
 
 1. **所有 if 分支必须有正反两面用例**：
    - `hb == nullptr` 的 true/false 分支
-   - `state != ThreadRunState::RUNNING` 的各种状态分支（NOT_STARTED/RUNNING/SLEEPING/STUCK/STOPPED）
+   - `state != ThreadRunState::RUNNING` 的各种状态分支（NOT_STARTED/RUNNING/SLEEPING/STOPPED）
+   - `healthState` 的 HEALTHY/TIMEOUT 分支（超时检测 + 首次告警 + 恢复）
    - `elapsed > timeoutUs` 的超时/未超时分支
    - `registered == false` 的跳过/不跳过分支
    - `GetTimeoutUsFromGuc` 的所有 switch-case + default

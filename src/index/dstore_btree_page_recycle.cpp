@@ -509,6 +509,7 @@ void BtreeRecycleWorker::BtreeRecycleThreadMain()
             WatchDogMgr::SetRunState(m_watchdogHandle, ThreadRunState::RUNNING);
             ObjSpaceMgrTask* task = m_btrRecycleTask.load(std::memory_order_acquire);
             if (task) {
+                WatchDogMgr::ReportProgress(m_watchdogHandle, "executing btree recycle task");
                 m_btreeRecycleResult = task->ExecuteRecycleBtreeTask();
                 m_btrRecycleTask.store(nullptr, std::memory_order_release);
                 WatchDogMgr::TouchHeartbeat(m_watchdogHandle);

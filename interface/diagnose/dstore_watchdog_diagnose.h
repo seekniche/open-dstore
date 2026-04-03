@@ -36,11 +36,13 @@ struct WatchDogThreadStatus : public DiagnoseItem {
     char threadName[64];
     WatchDogThreadType threadType;
     uint32_t threadIndex;
-    ThreadRunState runState;
+    ThreadRunState runState;           /* 线程自报状态 */
+    ThreadHealthState healthState;     /* WatchDog 推断的健康状态 */
     bool isTimeout;
     uint64_t lastHeartbeatUs;
     uint64_t elapsedUs;
     uint64_t timeoutThresholdUs;
+    char progressMsg[WATCHDOG_PROGRESS_MSG_LEN];  /* 线程最后汇报的进度描述 */
 };
 
 #pragma GCC visibility push(default)

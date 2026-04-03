@@ -38,9 +38,11 @@ WatchDogMgr::WatchDogMgr()
     for (uint32 i = 0; i < MAX_WATCHED_THREADS; i++) {
         m_heartbeats[i].lastHeartbeatUs.store(0, std::memory_order_relaxed);
         m_heartbeats[i].runState.store(ThreadRunState::NOT_STARTED, std::memory_order_relaxed);
+        m_heartbeats[i].healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
         m_heartbeats[i].threadType = WatchDogThreadType::WATCHDOG_THREAD_TYPE_COUNT;
         m_heartbeats[i].threadIndex = 0;
         m_heartbeats[i].threadName[0] = '\0';
+        m_heartbeats[i].progressMsg[0] = '\0';
         m_heartbeats[i].registered.store(false, std::memory_order_relaxed);
     }
 }
@@ -133,6 +135,8 @@ WatchDogHandle *WatchDogMgr::Register(WatchDogThreadType type, uint32 index, con
     uint64 nowUs = GetSteadyClockUs();
     hb->lastHeartbeatUs.store(nowUs, std::memory_order_relaxed);
     hb->runState.store(ThreadRunState::NOT_STARTED, std::memory_order_relaxed);
+    hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
+    hb->progressMsg[0] = '\0';
     hb->registered.store(true, std::memory_order_release);
 
     ErrLog(DSTORE_LOG, MODULE_WATCHDOG,
@@ -204,6 +208,20 @@ uint64 WatchDogMgr::GetTimeoutUsFromGuc(WatchDogThreadType type) const
     return static_cast<uint64>(timeoutSec) * US_PER_SEC;
 }
 
+void WatchDogMgr::ReportProgress(WatchDogHandle *hb, const char *msg)
+{
+    if (hb == nullptr) {
+        return;
+    }
+    TouchHeartbeat(hb);
+    if (msg != nullptr) {
+        error_t rc = strncpy_s(hb->progressMsg, sizeof(hb->progressMsg), msg, sizeof(hb->progressMsg) - 1);
+        storage_securec_check(rc, "\0", "\0");
+    } else {
+        hb->progressMsg[0] = '\0';
+    }
+}
+
 void WatchDogMgr::CheckAllHeartbeats()
 {
 #ifdef UT
@@ -222,6 +240,8 @@ void WatchDogMgr::CheckAllHeartbeats()
 
         ThreadRunState state = hb->runState.load(std::memory_order_relaxed);
         if (state != ThreadRunState::RUNNING) {
+            /* 非 RUNNING 状态(SLEEPING/NOT_STARTED/STOPPED)恢复健康 */
+            hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
             continue;
         }
 
@@ -230,13 +250,18 @@ void WatchDogMgr::CheckAllHeartbeats()
         uint64 timeoutUs = GetTimeoutUsFromGuc(hb->threadType);
 
         if (elapsed > timeoutUs) {
-            ErrLog(DSTORE_ERROR, MODULE_WATCHDOG,
-                ErrMsg("WatchDog STUCK DETECTED: thread '%s' (type=%d, index=%u) "
-                       "no heartbeat for %lu us (timeout=%lu us), pdbId=%u.",
-                       hb->threadName, static_cast<int>(hb->threadType), hb->threadIndex,
-                       elapsed, timeoutUs, m_pdbId));
-
-            hb->runState.store(ThreadRunState::STUCK, std::memory_order_relaxed);
+            /* 仅在首次检测到超时时打印告警（HEALTHY → TIMEOUT） */
+            ThreadHealthState prevHealth = hb->healthState.load(std::memory_order_relaxed);
+            if (prevHealth != ThreadHealthState::TIMEOUT) {
+                ErrLog(DSTORE_ERROR, MODULE_WATCHDOG,
+                    ErrMsg("WatchDog TIMEOUT DETECTED: thread '%s' (type=%d, index=%u) "
+                           "no heartbeat for %lu us (timeout=%lu us), lastProgress='%s', pdbId=%u.",
+                           hb->threadName, static_cast<int>(hb->threadType), hb->threadIndex,
+                           elapsed, timeoutUs, hb->progressMsg, m_pdbId));
+            }
+            hb->healthState.store(ThreadHealthState::TIMEOUT, std::memory_order_relaxed);
+        } else {
+            hb->healthState.store(ThreadHealthState::HEALTHY, std::memory_order_relaxed);
         }
     }
 }
@@ -287,10 +312,14 @@ uint32 WatchDogMgr::GetHeartbeatSnapshot(WatchDogHandle *outArray, uint32 maxCou
         WatchDogHandle *dst = &outArray[validCount];
         dst->lastHeartbeatUs.store(src->lastHeartbeatUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
         dst->runState.store(src->runState.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dst->healthState.store(src->healthState.load(std::memory_order_relaxed), std::memory_order_relaxed);
         dst->threadType = src->threadType;
         dst->threadIndex = src->threadIndex;
         error_t rc = strncpy_s(dst->threadName, sizeof(dst->threadName),
                                src->threadName, sizeof(dst->threadName) - 1);
+        storage_securec_check(rc, "\0", "\0");
+        rc = strncpy_s(dst->progressMsg, sizeof(dst->progressMsg),
+                       src->progressMsg, sizeof(dst->progressMsg) - 1);
         storage_securec_check(rc, "\0", "\0");
         dst->registered.store(true, std::memory_order_relaxed);
         validCount++;
@@ -320,10 +349,14 @@ uint32 WatchDogMgr::GetHeartbeatsByType(WatchDogThreadType type,
         WatchDogHandle *dst = &outArray[validCount];
         dst->lastHeartbeatUs.store(src->lastHeartbeatUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
         dst->runState.store(src->runState.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dst->healthState.store(src->healthState.load(std::memory_order_relaxed), std::memory_order_relaxed);
         dst->threadType = src->threadType;
         dst->threadIndex = src->threadIndex;
         error_t rc = strncpy_s(dst->threadName, sizeof(dst->threadName),
                                src->threadName, sizeof(dst->threadName) - 1);
+        storage_securec_check(rc, "\0", "\0");
+        rc = strncpy_s(dst->progressMsg, sizeof(dst->progressMsg),
+                       src->progressMsg, sizeof(dst->progressMsg) - 1);
         storage_securec_check(rc, "\0", "\0");
         dst->registered.store(true, std::memory_order_relaxed);
         validCount++;

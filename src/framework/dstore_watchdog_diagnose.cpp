@@ -56,10 +56,20 @@ static const char *RunStateToString(ThreadRunState state)
             return "RUNNING";
         case ThreadRunState::SLEEPING:
             return "SLEEPING";
-        case ThreadRunState::STUCK:
-            return "STUCK";
         case ThreadRunState::STOPPED:
             return "STOPPED";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *HealthStateToString(ThreadHealthState state)
+{
+    switch (state) {
+        case ThreadHealthState::HEALTHY:
+            return "HEALTHY";
+        case ThreadHealthState::TIMEOUT:
+            return "TIMEOUT";
         default:
             return "UNKNOWN";
     }
@@ -71,15 +81,17 @@ static void FillThreadStatus(WatchDogThreadStatus *status, const WatchDogHandle 
     error_t rc = strncpy_s(status->threadName, sizeof(status->threadName),
                            hb->threadName, sizeof(status->threadName) - 1);
     storage_securec_check(rc, "\0", "\0");
+    rc = strncpy_s(status->progressMsg, sizeof(status->progressMsg),
+                   hb->progressMsg, sizeof(status->progressMsg) - 1);
+    storage_securec_check(rc, "\0", "\0");
     status->threadType = hb->threadType;
     status->threadIndex = hb->threadIndex;
     status->runState = hb->runState.load(std::memory_order_relaxed);
+    status->healthState = hb->healthState.load(std::memory_order_relaxed);
     status->lastHeartbeatUs = hb->lastHeartbeatUs.load(std::memory_order_relaxed);
     status->elapsedUs = nowUs - status->lastHeartbeatUs;
     status->timeoutThresholdUs = mgr->GetTimeoutUsFromGuc(hb->threadType);
-    status->isTimeout = (status->runState == ThreadRunState::RUNNING ||
-                         status->runState == ThreadRunState::STUCK) &&
-                        (status->elapsedUs > status->timeoutThresholdUs);
+    status->isTimeout = (status->healthState == ThreadHealthState::TIMEOUT);
 }
 
 RetStatus WatchDogDiagnose::GetAllThreadStatus(PdbId pdbId,
@@ -222,37 +234,37 @@ char *WatchDogDiagnose::GetFormattedSummary(PdbId pdbId)
 
     str.append("================== WatchDog Thread Status ==================\n");
     str.append("PDB: %u\n\n", pdbId);
-    str.append("%-20s %-20s %-6s %-10s %-9s %-11s %-12s\n",
-               "Thread Name", "Type", "Index", "State", "Timeout?", "Elapsed(s)", "Threshold(s)");
-    str.append("--------------------+--------------------+------+----------+---------+-----------+-------------\n");
+    str.append("%-20s %-16s %-6s %-10s %-8s %-11s %-12s %s\n",
+               "Thread Name", "Type", "Index", "RunState", "Health", "Elapsed(s)", "Threshold(s)", "Progress");
+    str.append("--------------------+----------------+------+----------+--------+-----------+-------------+--------\n");
 
     uint64 nowUs = WatchDogMgr::GetSteadyClockUs();
-    uint32 stuckCount = 0;
+    uint32 timeoutCount = 0;
 
     for (uint32 i = 0; i < count; i++) {
         const WatchDogHandle *hb = &snapshot[i];
-        ThreadRunState state = hb->runState.load(std::memory_order_relaxed);
+        ThreadRunState runSt = hb->runState.load(std::memory_order_relaxed);
+        ThreadHealthState healthSt = hb->healthState.load(std::memory_order_relaxed);
         uint64 lastHbUs = hb->lastHeartbeatUs.load(std::memory_order_relaxed);
         uint64 elapsedUs = nowUs - lastHbUs;
         uint64 timeoutUs = mgr->GetTimeoutUsFromGuc(hb->threadType);
-        bool isTimeout = (state == ThreadRunState::RUNNING || state == ThreadRunState::STUCK) &&
-                         (elapsedUs > timeoutUs);
 
-        if (state == ThreadRunState::STUCK) {
-            stuckCount++;
+        if (healthSt == ThreadHealthState::TIMEOUT) {
+            timeoutCount++;
         }
 
-        str.append("%-20s %-20s %-6u %-10s %-9s %-11.1f %-12.1f\n",
+        str.append("%-20s %-16s %-6u %-10s %-8s %-11.1f %-12.1f %s\n",
                    hb->threadName,
                    ThreadTypeToString(hb->threadType),
                    hb->threadIndex,
-                   RunStateToString(state),
-                   isTimeout ? "YES" : "NO",
+                   RunStateToString(runSt),
+                   HealthStateToString(healthSt),
                    static_cast<double>(elapsedUs) / 1000000.0,
-                   static_cast<double>(timeoutUs) / 1000000.0);
+                   static_cast<double>(timeoutUs) / 1000000.0,
+                   hb->progressMsg);
     }
 
-    str.append("\nStuck Threads: %u\n", stuckCount);
+    str.append("\nTimeout Threads: %u\n", timeoutCount);
     str.append("================================================================\n");
 
     return str.data;
@@ -287,20 +299,20 @@ char *WatchDogDiagnose::GetFormattedStatusByType(PdbId pdbId, WatchDogThreadType
 
     for (uint32 i = 0; i < count; i++) {
         const WatchDogHandle *hb = &snapshot[i];
-        ThreadRunState state = hb->runState.load(std::memory_order_relaxed);
+        ThreadRunState runSt = hb->runState.load(std::memory_order_relaxed);
+        ThreadHealthState healthSt = hb->healthState.load(std::memory_order_relaxed);
         uint64 lastHbUs = hb->lastHeartbeatUs.load(std::memory_order_relaxed);
         uint64 elapsedUs = nowUs - lastHbUs;
         uint64 timeoutUs = mgr->GetTimeoutUsFromGuc(hb->threadType);
-        bool isTimeout = (state == ThreadRunState::RUNNING || state == ThreadRunState::STUCK) &&
-                         (elapsedUs > timeoutUs);
 
-        str.append("  [%u] %s: state=%s, timeout=%s, elapsed=%.1fs, threshold=%.1fs\n",
+        str.append("  [%u] %s: runState=%s, health=%s, elapsed=%.1fs, threshold=%.1fs, progress='%s'\n",
                    hb->threadIndex,
                    hb->threadName,
-                   RunStateToString(state),
-                   isTimeout ? "YES" : "NO",
+                   RunStateToString(runSt),
+                   HealthStateToString(healthSt),
                    static_cast<double>(elapsedUs) / 1000000.0,
-                   static_cast<double>(timeoutUs) / 1000000.0);
+                   static_cast<double>(timeoutUs) / 1000000.0,
+                   hb->progressMsg);
     }
 
     if (count == 0) {
