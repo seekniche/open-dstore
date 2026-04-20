@@ -22,7 +22,7 @@ fi
 #-------------------------------------------
 # code path
 #-------------------------------------------
-export BUILD_ROOT=/xxx/dstore
+export BUILD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LOCAL_LIB_PATH=$BUILD_ROOT/../local_libs
 
 #-------------------------------------------
@@ -57,6 +57,8 @@ export CXX=$GCCFOLDER/gcc/bin/g++
 export LD_LIBRARY_PATH=$GCCFOLDER/gcc/lib64:$GCCFOLDER/isl/lib:$GCCFOLDER/mpc/lib/:$GCCFOLDER/mpfr/lib/:$GCCFOLDER/gmp/lib/:$LD_LIBRARY_PATH
 if [ "$OS_NAME" == "Huawei Cloud EulerOS" ]; then
   \cp /usr/lib64/libstdc++.so.6 $GCCFOLDER/gcc/lib64/
+elif [ "$OS_NAME" == "Ubuntu" ]; then
+  \cp /usr/lib/x86_64-linux-gnu/libstdc++.so.6 $GCCFOLDER/gcc/lib64/
 fi
 
 #-------------------------------------------

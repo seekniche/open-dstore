@@ -1,0 +1,6 @@
+.vscode
+tmp_build
+output
+build
+scripts/makedstore.log
+utils/scripts/makeutils.log

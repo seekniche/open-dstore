@@ -64,9 +64,9 @@ make -j$(nproc) && make install
 上述依赖库编译完成后，请按库名称调整目录结构。例如，在`local_libs/secure`目录下，应包含该库对应的include和lib子目录。
 
 
-## 1.2 更新并加载环境配置文件
-修改`dstore/buildenv`文件中`BUILD_ROOT`变量的值为当前项目所在目录，如：`BUILD_ROOT=/opt/project/dstore`
+## 1.2 加载环境配置文件
 执行：`source dstore/buildenv`
+（`BUILD_ROOT`会自动解析为`buildenv`所在目录，无需手动修改）
 
 
 # 二、项目编译

@@ -69,7 +69,8 @@ fi
 
 # cpu num
 cpu_processor_num=$(grep processor /proc/cpuinfo | wc -l)
-job_num=$(expr "$cpu_processor_num" \* 2)
+#job_num=$(expr "$cpu_processor_num" \* 2)
+job_num=$64
 log "[INFO] Compile parallel job num:${job_num}"
 
 # build path
