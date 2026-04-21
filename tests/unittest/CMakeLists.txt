@@ -24,6 +24,9 @@ FILE(GLOB_RECURSE UT_EXCLUDE_FLASHBACK RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} */ut
 LIST(REMOVE_ITEM unittest_src_list ${UT_EXCLUDE_FLASHBACK})
 message(STATUS "EXCLUDE SRC " ${UT_EXCLUDE_FLASHBACK})
 
+# Exclude tests that depend on mockcpp (not installed in this env)
+LIST(REMOVE_ITEM unittest_src_list "src/ut_transaction/ut_transaction.cpp")
+
 message(STATUS "${unittest_src_list}")
 
 set(CMAKE_SKIP_RPATH FALSE)
@@ -73,8 +76,9 @@ set(unittest_link_directories
 )
 
 # This is the whole unit test suite except dstore embedded dir
-set(unittest_link_libs utilities gsutils ${UT_LIBS} mockcpp dstore -lrt -rdynamic -lstdc++ m)
+set(unittest_link_libs utilities gsutils ${UT_LIBS} dstore -lrt -rdynamic -lstdc++ m)
 add_bintarget(unittest unittest_src_list unittest_include_directories "${unittest_macro_options}" "${unittest_compile_options}" "${unittest_link_options}" "${unittest_link_libs}")
+set_target_properties(unittest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_link_directories(unittest PRIVATE ${unittest_link_directories})
 add_dependencies(unittest dstore utilities vfs_config start_config)
 

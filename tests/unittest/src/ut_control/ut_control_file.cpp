@@ -880,8 +880,8 @@ TEST_F(ControlFileTest, UpdateOneWalStreamTestConcurrently_level0)
     DstorePfreeExt(itemData2);
 
     /* update itemData1 */
-    retStatus =
-        controlFile->UpdateWalStreamForCheckPoint(0xff, itemData1->lastCheckpointPLsn, itemData1->lastWalCheckpoint);
+    itemData1->walId = 0xff;
+    retStatus = controlFile->UpdateWalStreamForCheckPoint(*itemData1);
     ASSERT_EQ(retStatus, DSTORE_SUCC);
     CheckCreateFilePara(itemData1->createFilePara, itemData1->walFileSize);
     controlFile->FreeWalStreamsInfo(itemData1);

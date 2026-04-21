@@ -772,13 +772,24 @@ uint64 WalFileManager::GetRecyclablePlsn() const
         return INVALID_PLSN;
     }
 
+    /*
+     * Recycling honours the OLDEST slot in the checkpoint history ring instead of
+     * just the latest checkpoint plsn. Recovery may fall back to one of those older
+     * slots when the newest checkpoint is unparseable, so the WAL it points at
+     * must still be physically on disk.
+     */
+    WalCheckPointHistory history{};
+    if (STORAGE_FUNC_SUCC(ckpMgr->GetWalCheckpointHistory(m_initWalFilesPara.walId, history)) &&
+        history.slotCount > 0) {
+        return history.GetOldestDiskRecoveryPlsn();
+    }
+
+    /* Fallback for upgrade / not-yet-populated cases: use the legacy single checkpoint. */
     WalCheckPoint walCheckpoint;
     if (STORAGE_FUNC_FAIL(ckpMgr->GetWalCheckpoint(m_initWalFilesPara.walId, walCheckpoint))) {
         return INVALID_PLSN;
     }
-
-    uint64 minRecyclablePlsn = walCheckpoint.diskRecoveryPlsn;
-    return minRecyclablePlsn;
+    return walCheckpoint.diskRecoveryPlsn;
 }
 
 bool WalFileManager::WalFileRecyclable(WalFile *walFile)

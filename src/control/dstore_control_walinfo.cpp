@@ -74,9 +74,9 @@ RetStatus ControlWalInfo::UpdateWalStream(const ControlWalStreamPageItemData &st
     return UpdateWalStreamInternal(streamInfo);
 }
 
-RetStatus ControlWalInfo::UpdateWalStreamForCheckPoint(WalId walId, uint64 lastCheckpointPLsn,
-                                                       const WalCheckPoint &checkPoint)
+RetStatus ControlWalInfo::UpdateWalStreamForCheckPoint(const ControlWalStreamPageItemData &streamInfo)
 {
+    WalId walId = streamInfo.walId;
     if (STORAGE_FUNC_FAIL(m_lock->Lock(CFLockMode::CF_EXCLUSIVE))) {
         ErrLog(DSTORE_ERROR, MODULE_CONTROL, ErrMsg("Acquire control file lock fail."));
         return DSTORE_FAIL;
@@ -97,8 +97,11 @@ RetStatus ControlWalInfo::UpdateWalStreamForCheckPoint(WalId walId, uint64 lastC
         }
         if (itemData->walId == walId) {
             isExist = true;
-            itemData->lastCheckpointPLsn = lastCheckpointPLsn;
-            itemData->lastWalCheckpoint = checkPoint;
+            itemData->lastCheckpointPLsn = streamInfo.lastCheckpointPLsn;
+            itemData->lastWalCheckpoint = streamInfo.lastWalCheckpoint;
+            errno_t rc = memcpy_s(&itemData->checkpointHistory, sizeof(WalCheckPointHistory),
+                                  &streamInfo.checkpointHistory, sizeof(WalCheckPointHistory));
+            storage_securec_check(rc, "\0", "\0");
             MarkPageDirty(iterator.GetCurrentBlock());
             break;
         }
@@ -107,26 +110,25 @@ RetStatus ControlWalInfo::UpdateWalStreamForCheckPoint(WalId walId, uint64 lastC
     if (!isExist) {
         ErrLog(DSTORE_WARNING, MODULE_WAL,
                ErrMsg("Do not found wal stream %lu when update for checkpoint with diskRecoveryPlsn:%lu.", walId,
-                      checkPoint.diskRecoveryPlsn));
+                      streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
         return DSTORE_FAIL;
     }
     if (STORAGE_FUNC_FAIL(PostGroup())) {
         ErrLog(
             DSTORE_ERROR, MODULE_WAL,
             ErrMsg("Post write control file fail when update wal stream %lu for checkpoint with diskRecoveryPlsn:%lu.",
-                   walId, checkPoint.diskRecoveryPlsn));
+                   walId, streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
         return DSTORE_FAIL;
     }
     ErrLog(DSTORE_LOG, MODULE_WAL,
            ErrMsg("Update wal stream %lu for checkpoint with diskRecoveryPlsn:%lu success.", walId,
-                  checkPoint.diskRecoveryPlsn));
+                  streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
     return DSTORE_SUCC;
 }
 
-RetStatus ControlWalInfo::UpdateWalStreamForCheckPointWithBarrier(WalId walId, uint64 lastCheckpointPLsn,
-                                                                  const WalCheckPoint &checkPoint,
-                                                                  const WalBarrier &barrier)
+RetStatus ControlWalInfo::UpdateWalStreamForCheckPointWithBarrier(const ControlWalStreamPageItemData &streamInfo)
 {
+    WalId walId = streamInfo.walId;
     if (STORAGE_FUNC_FAIL(m_lock->Lock(CFLockMode::CF_EXCLUSIVE))) {
         ErrLog(DSTORE_ERROR, MODULE_CONTROL, ErrMsg("Acquire control file lock fail."));
         return DSTORE_FAIL;
@@ -147,9 +149,12 @@ RetStatus ControlWalInfo::UpdateWalStreamForCheckPointWithBarrier(WalId walId, u
         }
         if (itemData->walId == walId) {
             isExist = true;
-            itemData->lastCheckpointPLsn = lastCheckpointPLsn;
-            itemData->lastWalCheckpoint = checkPoint;
-            itemData->barrier = barrier;
+            itemData->lastCheckpointPLsn = streamInfo.lastCheckpointPLsn;
+            itemData->lastWalCheckpoint = streamInfo.lastWalCheckpoint;
+            errno_t rc = memcpy_s(&itemData->checkpointHistory, sizeof(WalCheckPointHistory),
+                                  &streamInfo.checkpointHistory, sizeof(WalCheckPointHistory));
+            storage_securec_check(rc, "\0", "\0");
+            itemData->barrier = streamInfo.barrier;
             MarkPageDirty(iterator.GetCurrentBlock());
             break;
         }
@@ -158,19 +163,19 @@ RetStatus ControlWalInfo::UpdateWalStreamForCheckPointWithBarrier(WalId walId, u
     if (!isExist) {
         ErrLog(DSTORE_WARNING, MODULE_WAL,
                ErrMsg("Do not found wal stream %lu when update for checkpoint with diskRecoveryPlsn:%lu.", walId,
-                      checkPoint.diskRecoveryPlsn));
+                      streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
         return DSTORE_FAIL;
     }
     if (STORAGE_FUNC_FAIL(PostGroup())) {
         ErrLog(
             DSTORE_ERROR, MODULE_WAL,
             ErrMsg("Post write control file fail when update wal stream %lu for checkpoint with diskRecoveryPlsn:%lu.",
-                   walId, checkPoint.diskRecoveryPlsn));
+                   walId, streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
         return DSTORE_FAIL;
     }
     ErrLog(DSTORE_LOG, MODULE_WAL,
            ErrMsg("Update wal stream %lu for checkpoint with diskRecoveryPlsn:%lu success.", walId,
-                  checkPoint.diskRecoveryPlsn));
+                  streamInfo.lastWalCheckpoint.diskRecoveryPlsn));
     return DSTORE_SUCC;
 }
 

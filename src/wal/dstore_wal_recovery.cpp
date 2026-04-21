@@ -208,7 +208,7 @@ RetStatus WalRecovery::Init(RedoMode redoMode, PdbId pdbId, uint64 term)
                ErrMsg("[PDB:%u WAL:%lu]WalRecovery control file get wal stream info fail.", m_pdbId, m_walId));
         return DSTORE_FAIL;
     }
-    InitRecoveryPlsn(walStreamInfo->walId, &walStreamInfo->lastWalCheckpoint);
+    InitRecoveryPlsn(walStreamInfo->walId, walStreamInfo);
     controlFile->FreeWalStreamsInfo(walStreamInfo);
 
     InitRedoStatisticInfo(m_recoveryStartPlsn, m_redoWorkerNum);
@@ -241,7 +241,7 @@ inline void WalRecovery::FillBatchRedoEntry(RedoWalRecordEntry &entry,
     entry.walRecordInfo.walRecord = walRecord;
 }
 
-inline void WalRecovery::AddPlsnSyncer(RedoWalRecordEntry &recordEntry, uint32 &recordEntryNum, uint64 recordEndPlsn)
+void WalRecovery::AddPlsnSyncer(RedoWalRecordEntry &recordEntry, uint32 &recordEntryNum, uint64 recordEndPlsn)
 {
     recordEntry.recordEndPlsn = recordEndPlsn;
     recordEntry.ctx = {INVALID_XID, INVALID_WAL_ID, INVALID_PDB_ID, INVALID_PLSN};
@@ -1966,23 +1966,113 @@ void WalRecovery::InitRedoStatisticInfoTotalNeedPlsn(uint64 lastGroupPlsn)
     }
 }
 
-void WalRecovery::InitRecoveryPlsn(WalId walId, WalCheckPoint *lastWalCheckpoint)
+RetStatus WalRecovery::ProbeWalGroupAtPlsn(WalId walId, uint64 candidatePlsn)
 {
-    uint64 recoveryPlsn = INVALID_PLSN;
-    uint64 diskRecoveryPlsn = lastWalCheckpoint->diskRecoveryPlsn;
-    uint64 memRecoveryPlsn = lastWalCheckpoint->memoryCheckpoint.memRecoveryPlsn;
+    if (candidatePlsn == INVALID_PLSN) {
+        return DSTORE_FAIL;
+    }
+    DstoreMemoryContext probeCtx = DstoreAllocSetContextCreate(
+        m_memoryContext, "WalCheckpointProbe", ALLOCSET_DEFAULT_SIZES, MemoryContextType::THREAD_CONTEXT);
+    if (STORAGE_VAR_NULL(probeCtx)) {
+        ErrLog(DSTORE_ERROR, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery probe alloc memcontext fail at plsn:%lu.",
+                m_pdbId, walId, candidatePlsn));
+        return DSTORE_FAIL;
+    }
+    WalReaderConf conf = {walId, candidatePlsn, m_walStream, nullptr, m_walFileSize,
+                          WalReadSource::WAL_READ_FROM_DISK};
+    WalRecordReader *reader = nullptr;
+    RetStatus retStatus = WalRecordReader::AllocateWalReader(conf, &reader, probeCtx);
+    if (STORAGE_FUNC_FAIL(retStatus)) {
+        DstoreMemoryContextDelete(probeCtx);
+        return DSTORE_FAIL;
+    }
+    const WalRecordAtomicGroup *walGroup = nullptr;
+    retStatus = reader->ReadNext(&walGroup);
+    bool ok = (STORAGE_FUNC_SUCC(retStatus) && walGroup != nullptr);
+    delete reader;
+    DstoreMemoryContextDelete(probeCtx);
+    return ok ? DSTORE_SUCC : DSTORE_FAIL;
+}
+
+void WalRecovery::HandleAllSlotsCorrupted(WalId walId, const WalCheckPointHistory &history)
+{
+    ErrLog(DSTORE_ERROR, MODULE_WAL,
+        ErrMsg("[PDB:%u WAL:%lu]WalRecovery all %hhu checkpoint history slots failed to probe, manual intervention "
+               "required (use waldump to repair control file). slotCount=%hhu newestSlotIdx=%hhu.",
+            m_pdbId, walId, history.slotCount, history.slotCount, history.newestSlotIdx));
+    for (uint8 i = 0; i < history.slotCount; ++i) {
+        ErrLog(DSTORE_ERROR, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]  slot[%hhu] time:%ld diskRecoveryPlsn:%lu memRecoveryPlsn:%lu.",
+                m_pdbId, walId, i, history.slots[i].time, history.slots[i].diskRecoveryPlsn,
+                history.slots[i].memoryCheckpoint.memRecoveryPlsn));
+    }
+    ErrLog(DSTORE_PANIC, MODULE_WAL,
+        ErrMsg("[PDB:%u WAL:%lu]WalRecovery cannot select a recovery start plsn from checkpoint history.",
+            m_pdbId, walId));
+}
+
+void WalRecovery::InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemData *streamInfo)
+{
+    const WalCheckPoint &latest = streamInfo->lastWalCheckpoint;
+    uint64 diskRecoveryPlsn = latest.diskRecoveryPlsn;
+    uint64 memRecoveryPlsn = latest.memoryCheckpoint.memRecoveryPlsn;
     m_diskRecoveryStartPlsn = diskRecoveryPlsn;
 
-    if (diskRecoveryPlsn >= memRecoveryPlsn) {
-        recoveryPlsn = diskRecoveryPlsn;
-        goto EXIT;
+    /*
+     * Fast path: probe the newest checkpoint's diskRecoveryPlsn. When the probe
+     * succeeds we adopt it directly — behaviour is then identical to the
+     * pre-history implementation in the overwhelmingly common case. The slow
+     * path runs only when the newest checkpoint itself fails to parse.
+     */
+    if (diskRecoveryPlsn != INVALID_PLSN &&
+        STORAGE_FUNC_SUCC(ProbeWalGroupAtPlsn(walId, diskRecoveryPlsn))) {
+        ErrLog(DSTORE_LOG, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery checkpoint(fast) diskRecoveryPlsn:%lu memRecoveryPlsn:%lu "
+                   "recoveryPlsn:%lu.",
+                m_pdbId, walId, diskRecoveryPlsn, memRecoveryPlsn, diskRecoveryPlsn));
+        m_recoveryStartPlsn = diskRecoveryPlsn;
+        return;
     }
-    recoveryPlsn = lastWalCheckpoint->diskRecoveryPlsn;
-EXIT:
-    ErrLog(DSTORE_LOG, MODULE_WAL,
-        ErrMsg("[PDB:%u WAL:%lu]WalRecovery checkpoint diskRecoveryPlsn:%lu memRecoveryPlsn:%lu recoveryPlsn:%lu.",
-        m_pdbId, walId, diskRecoveryPlsn, memRecoveryPlsn, recoveryPlsn));
-    m_recoveryStartPlsn = recoveryPlsn;
+
+    if (diskRecoveryPlsn != INVALID_PLSN) {
+        ErrLog(DSTORE_WARNING, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery latest checkpoint diskRecoveryPlsn:%lu probe failed, "
+                   "falling back to checkpoint history.",
+                m_pdbId, walId, diskRecoveryPlsn));
+    }
+
+    /*
+     * Slow path: walk the checkpoint history ring from second-newest (k=1) to oldest
+     * (k=slotCount-1) and adopt the first slot whose diskRecoveryPlsn parses as a
+     * valid wal group on disk. k=0 is the newest slot we already probed above, so
+     * skip it to avoid a redundant probe (invariant I3: slots[newestSlotIdx] ==
+     * lastWalCheckpoint).
+     */
+    const WalCheckPointHistory &history = streamInfo->checkpointHistory;
+    for (uint8 k = 1; k < history.slotCount; ++k) {
+        uint8 idx = history.GetSlotIdxByAge(k);
+        const WalCheckPoint &slot = history.slots[idx];
+        if (slot.diskRecoveryPlsn == INVALID_PLSN) {
+            continue;
+        }
+        if (STORAGE_FUNC_FAIL(ProbeWalGroupAtPlsn(walId, slot.diskRecoveryPlsn))) {
+            ErrLog(DSTORE_WARNING, MODULE_WAL,
+                ErrMsg("[PDB:%u WAL:%lu]WalRecovery checkpoint slot age=%hhu (idx=%hhu) "
+                       "diskRecoveryPlsn:%lu probe failed, fall back further.",
+                    m_pdbId, walId, k, idx, slot.diskRecoveryPlsn));
+            continue;
+        }
+        m_diskRecoveryStartPlsn = slot.diskRecoveryPlsn;
+        m_recoveryStartPlsn = slot.diskRecoveryPlsn;
+        ErrLog(DSTORE_WARNING, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery checkpoint(slow) adopted slot age=%hhu (idx=%hhu) "
+                   "diskRecoveryPlsn:%lu memRecoveryPlsn:%lu.",
+                m_pdbId, walId, k, idx, slot.diskRecoveryPlsn, slot.memoryCheckpoint.memRecoveryPlsn));
+        return;
+    }
+
+    HandleAllSlotsCorrupted(walId, history);
 }
 
 void WalRecovery::PrepareBgThreads()

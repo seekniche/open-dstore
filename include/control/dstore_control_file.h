@@ -628,42 +628,40 @@ public:
      * Update WalStream element for checkpoint usage.
      *
      * NOTE: This function only update partial elements for checkpoint usage. Checkpoint invokes rather than
-     * UpdateWalStream to avoid concurrent updating problems.
+     * UpdateWalStream to avoid concurrent updating problems. The fields lastCheckpointPLsn, lastWalCheckpoint and
+     * checkpointHistory in `streamInfo` are persisted.
      *
-     * @param walId is the WalId of the target wal stream
-     * @param lastCheckPointPlsn, checkPoint, barrier are elements to be updated
+     * @param streamInfo carries walId plus the new checkpoint state to persist
      * @return update result
      */
-    RetStatus UpdateWalStreamForCheckPoint(WalId walId, uint64 lastCheckpointPlsn, const WalCheckPoint &checkPoint)
+    RetStatus UpdateWalStreamForCheckPoint(const ControlWalStreamPageItemData &streamInfo)
     {
         if (unlikely(!m_initialized.load(std::memory_order_acquire))) {
             storage_set_error(CONTROL_ERROR_NOT_INITIALIZED);
             ErrLog(DSTORE_ERROR, MODULE_CONTROL, ErrMsg("ControlFile is not initialized."));
             return DSTORE_FAIL;
         }
-        return m_controlWalInfo->UpdateWalStreamForCheckPoint(walId, lastCheckpointPlsn, checkPoint);
+        return m_controlWalInfo->UpdateWalStreamForCheckPoint(streamInfo);
     }
 
     /**
      * Update WalStream element for checkpoint usage with barrier.
      *
      * NOTE: This function only update partial elements for checkpoint usage. Checkpoint invokes rather than
-     * UpdateWalStream to avoid concurrent updating problems.
+     * UpdateWalStream to avoid concurrent updating problems. The fields lastCheckpointPLsn, lastWalCheckpoint,
+     * checkpointHistory and barrier in `streamInfo` are persisted.
      *
-     * @param walId is the WalId of the target wal stream
-     * @param lastCheckPointPlsn, checkPoint, barrier are elements to be updated
+     * @param streamInfo carries walId plus the new checkpoint state and barrier to persist
      * @return update result
      */
-    RetStatus UpdateWalStreamForCheckPointWithBarrier(WalId walId, uint64 lastCheckpointPlsn,
-                                                      const WalCheckPoint &checkPoint, const WalBarrier &barrier)
+    RetStatus UpdateWalStreamForCheckPointWithBarrier(const ControlWalStreamPageItemData &streamInfo)
     {
         if (unlikely(!m_initialized.load(std::memory_order_acquire))) {
             storage_set_error(CONTROL_ERROR_NOT_INITIALIZED);
             ErrLog(DSTORE_ERROR, MODULE_CONTROL, ErrMsg("ControlFile is not initialized."));
             return DSTORE_FAIL;
         }
-        return m_controlWalInfo->UpdateWalStreamForCheckPointWithBarrier(walId, lastCheckpointPlsn, checkPoint,
-                                                                         barrier);
+        return m_controlWalInfo->UpdateWalStreamForCheckPointWithBarrier(streamInfo);
     }
     /**
      * Delete WalStream element.

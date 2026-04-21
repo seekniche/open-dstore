@@ -55,7 +55,12 @@ struct ControlWalStreamPageItemData {
     uint64 walMinRecoveryPlsn;       /* wal stream min recovery point */
     uint64 archivePlsn;              /* wal stream archive point */
     uint64 lastCheckpointPLsn;       /* the start location of last checkpoint Wal record */
-    WalCheckPoint lastWalCheckpoint; /* the copy of last checkpoint Wal record */
+    /*
+     * lastWalCheckpoint mirrors checkpointHistory.slots[checkpointHistory.newestSlotIdx] and is kept
+     * for backward compatibility with code paths (diagnostics / legacy readers) that still consume it.
+     */
+    WalCheckPoint lastWalCheckpoint;
+    WalCheckPointHistory checkpointHistory; /* recent N checkpoint slots, recovery-time fallback */
     FileParameter createFilePara;    /* the parameter of creating walFile for backup using */
     uint16 initWalFileCount;         /* default wal file count, not updated in real time */
     WalBarrier barrier;              /* barrier info include csn, end plsn and sync mode */
@@ -73,8 +78,11 @@ struct ControlWalStreamPageItemData {
         destPage.lastWalCheckpoint.time = srcPage.lastWalCheckpoint.time;
         destPage.lastWalCheckpoint.diskRecoveryPlsn = srcPage.lastWalCheckpoint.diskRecoveryPlsn;
         destPage.lastWalCheckpoint.memoryCheckpoint = srcPage.lastWalCheckpoint.memoryCheckpoint;
-        errno_t rc =
-            memcpy_s(&destPage.createFilePara, sizeof(FileParameter), &srcPage.createFilePara, sizeof(FileParameter));
+        errno_t rc = memcpy_s(&destPage.checkpointHistory, sizeof(WalCheckPointHistory),
+                              &srcPage.checkpointHistory, sizeof(WalCheckPointHistory));
+        storage_securec_check(rc, "\0", "\0");
+        rc = memcpy_s(&destPage.createFilePara, sizeof(FileParameter), &srcPage.createFilePara,
+                      sizeof(FileParameter));
         storage_securec_check(rc, "\0", "\0");
         destPage.initWalFileCount = srcPage.initWalFileCount;
         destPage.barrier.barrierCsn = srcPage.barrier.barrierCsn;
@@ -91,7 +99,8 @@ struct ControlWalStreamPageItemData {
             "lastWalCheckpoint.diskRecoveryPlsn %lu, lastWalCheckpoint.memRecoveryPlsn %lu, "
             "storeSpaceName %s streamId %u flag %hu subtype %d rangeSize %u maxSize %lu recycleTtl %lu mode %d"
             "isReplayWrite %d initWalFileCount %d, "
-            "barrierCsn %lu barrierEndPlsn %lu barrierSyncMode %d version %u.\n",
+            "barrierCsn %lu barrierEndPlsn %lu barrierSyncMode %d version %u, "
+            "checkpointHistory.slotCount %hhu newestSlotIdx %hhu.\n",
             data->streamState, data->walId, data->walBlockSize, data->walFileSize, data->walMinRecoveryPlsn,
             data->archivePlsn, data->lastCheckpointPLsn, data->lastWalCheckpoint.time,
             data->lastWalCheckpoint.diskRecoveryPlsn, data->lastWalCheckpoint.memoryCheckpoint.memRecoveryPlsn,
@@ -99,7 +108,15 @@ struct ControlWalStreamPageItemData {
             data->createFilePara.fileSubType, data->createFilePara.rangeSize, data->createFilePara.maxSize,
             data->createFilePara.recycleTtl, data->createFilePara.mode, data->createFilePara.isReplayWrite,
             data->initWalFileCount, data->barrier.barrierCsn, data->barrier.barrierEndPlsn,
-            static_cast<int32>(data->barrier.barrierSyncMode), data->version);
+            static_cast<int32>(data->barrier.barrierSyncMode), data->version,
+            data->checkpointHistory.slotCount, data->checkpointHistory.newestSlotIdx);
+        for (uint8 i = 0; i < data->checkpointHistory.slotCount; ++i) {
+            dumpInfo.append(
+                "  checkpointHistory.slots[%hhu] time %ld diskRecoveryPlsn %lu memRecoveryPlsn %lu.\n", i,
+                data->checkpointHistory.slots[i].time,
+                data->checkpointHistory.slots[i].diskRecoveryPlsn,
+                data->checkpointHistory.slots[i].memoryCheckpoint.memRecoveryPlsn);
+        }
     }
 };
 using VnodeControlWalStreamPageItemDatas = ControlWalStreamPageItemData **;
@@ -144,23 +161,25 @@ public:
      * NOTE: This function only update partial elements for checkpoint usage. Checkpoint invokes rather than
      * UpdateWalStream to avoid concurrent updating problems.
      *
-     * @param walId is the WalId of the target wal stream
-     * @param lastCheckPointPlsn, checkPoint are elements to be updated
+     * The fields written to the control page are: lastCheckpointPLsn, lastWalCheckpoint and checkpointHistory.
+     *
+     * @param streamInfo carries walId plus the new checkpoint state to persist
      * @return update result
      */
-    RetStatus UpdateWalStreamForCheckPoint(WalId walId, uint64 lastCheckPointPlsn, const WalCheckPoint &checkPoint);
+    RetStatus UpdateWalStreamForCheckPoint(const ControlWalStreamPageItemData &streamInfo);
     /**
      * Update WalStream element for checkpoint usage with barrier.
      *
      * NOTE: This function only update partial elements for checkpoint usage. Checkpoint invokes rather than
      * UpdateWalStream to avoid concurrent updating problems.
      *
-     * @param walId is the WalId of the target wal stream
-     * @param lastCheckPointPlsn, checkPoint, barrier are elements to be updated
+     * The fields written to the control page are: lastCheckpointPLsn, lastWalCheckpoint, checkpointHistory and
+     * barrier.
+     *
+     * @param streamInfo carries walId plus the new checkpoint state and barrier to persist
      * @return update result
      */
-    RetStatus UpdateWalStreamForCheckPointWithBarrier(WalId walId, uint64 lastCheckPointPlsn,
-                                                      const WalCheckPoint &checkPoint, const WalBarrier &barrier);
+    RetStatus UpdateWalStreamForCheckPointWithBarrier(const ControlWalStreamPageItemData &streamInfo);
     /**
      * Delete WalStream element.
      *

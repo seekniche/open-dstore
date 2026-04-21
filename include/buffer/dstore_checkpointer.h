@@ -112,6 +112,13 @@ struct WalCheckpointInfoData {
     DstoreSpinLock recoveryLock; /* protect the field below */
     uint64 lastCheckPointRecoveryPlsn;
     WalCheckPoint lastCheckPoint;
+    /*
+     * In-memory mirror of ControlWalStreamPageItemData::checkpointHistory. WAL recycling
+     * reads it via CheckpointMgr::GetWalCheckpointHistory to take the oldest slot's
+     * diskRecoveryPlsn as the recycling lower bound, so that a recovery fall-back can
+     * still find its WAL on disk.
+     */
+    WalCheckPointHistory lastCheckPointHistory;
 };
 
 struct WalCheckpointStatInfo {
@@ -172,6 +179,15 @@ public:
      * @return SRORAGE_SUCC if fetch info success
      */
     RetStatus GetWalCheckpoint(WalId walId, WalCheckPoint &walCheckpoint);
+
+    /*
+     * GetWalCheckpointHistory of target walStream
+     * @param[in] walId for target WalStream
+     * @param[out] history is the in-memory mirror of the checkpoint slot ring
+     *
+     * @return DSTORE_SUCC if fetch info success, DSTORE_FAIL if walId not found or mgr not inited
+     */
+    RetStatus GetWalCheckpointHistory(WalId walId, WalCheckPointHistory &history);
 
     RetStatus FullCheckpoint(PdbId pdbId);
 

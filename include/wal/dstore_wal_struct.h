@@ -223,6 +223,62 @@ struct WalCheckPoint {
 };
 
 /*
+ * Ring buffer of recent WalCheckPoint entries.
+ *
+ * Recovery falls back to an older slot when the newest checkpoint plsn fails
+ * to parse a valid wal group; WAL recycling honors the oldest slot to make sure
+ * fall-back targets are physically still present on disk.
+ *
+ * Invariants (maintained by the checkpoint write path):
+ *   - slots[newestSlotIdx] always equals the most recent checkpoint.
+ *   - slotCount monotonically grows from 0 up to WAL_CHECKPOINT_HISTORY_SLOTS.
+ *   - slotCount == 0 means "no history yet" (fresh stream or legacy upgrade).
+ */
+constexpr uint8 WAL_CHECKPOINT_HISTORY_SLOTS = 3;
+
+struct WalCheckPointHistory {
+    uint8 slotCount;
+    uint8 newestSlotIdx;
+    uint16 _pad;
+    WalCheckPoint slots[WAL_CHECKPOINT_HISTORY_SLOTS];
+
+    /* k = 0 returns the newest slot, k = slotCount-1 the oldest. */
+    inline uint8 GetSlotIdxByAge(uint8 k) const
+    {
+        return static_cast<uint8>((newestSlotIdx + WAL_CHECKPOINT_HISTORY_SLOTS - k) %
+                                  WAL_CHECKPOINT_HISTORY_SLOTS);
+    }
+
+    /* Returns INVALID_PLSN (0) when no valid slot is available. */
+    inline uint64 GetOldestDiskRecoveryPlsn() const
+    {
+        if (slotCount == 0) {
+            return 0;
+        }
+        uint64 oldest = UINT64_MAX;
+        for (uint8 i = 0; i < slotCount; ++i) {
+            if (slots[i].diskRecoveryPlsn < oldest) {
+                oldest = slots[i].diskRecoveryPlsn;
+            }
+        }
+        return oldest;
+    }
+
+    /* Append `cp` as the new newest slot; rotates over the oldest one once full. */
+    inline void Push(const WalCheckPoint &cp)
+    {
+        uint8 nextSlot = (slotCount == 0) ? 0
+                                          : static_cast<uint8>((newestSlotIdx + 1) %
+                                                               WAL_CHECKPOINT_HISTORY_SLOTS);
+        slots[nextSlot] = cp;
+        newestSlotIdx = nextSlot;
+        if (slotCount < WAL_CHECKPOINT_HISTORY_SLOTS) {
+            slotCount++;
+        }
+    }
+};
+
+/*
  * Barrier info for control info.
  */
 struct WalBarrier {

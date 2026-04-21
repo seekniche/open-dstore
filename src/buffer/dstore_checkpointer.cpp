@@ -176,6 +176,23 @@ RetStatus CheckpointMgr::GetWalCheckpoint(WalId walId, WalCheckPoint &walCheckpo
     return DSTORE_SUCC;
 }
 
+RetStatus CheckpointMgr::GetWalCheckpointHistory(WalId walId, WalCheckPointHistory &history)
+{
+    if (!m_inited.load(std::memory_order_acquire)) {
+        return DSTORE_FAIL;
+    }
+    WalCheckpointInfoData *info = FindCheckpointInfo(walId);
+    if (info == nullptr) {
+        return DSTORE_FAIL;
+    }
+    DstoreLWLockAcquire(&info->checkpointLwLock, LW_SHARED);
+    errno_t rc = memcpy_s(&history, sizeof(WalCheckPointHistory), &info->lastCheckPointHistory,
+                          sizeof(WalCheckPointHistory));
+    LWLockRelease(&info->checkpointLwLock);
+    storage_securec_check(rc, "\0", "\0");
+    return DSTORE_SUCC;
+}
+
 RetStatus CheckpointMgr::CheckpointOneWalStream(WalId walId, CheckpointFlag flags, bool *isPerformed)
 {
     return CreateCheckpoint(walId, flags, isPerformed);
@@ -262,18 +279,27 @@ RetStatus CheckpointMgr::CreateCheckpoint(WalId walId, UNUSE_PARAM CheckpointFla
     uint64 lastrecoveryPlsn = walStreamInfo->lastWalCheckpoint.diskRecoveryPlsn;
     walStreamInfo->lastCheckpointPLsn = 0;
     walStreamInfo->lastWalCheckpoint = checkPoint;
+    /*
+     * Rotate the new checkpoint into the history ring before persisting, so that the control
+     * file write atomically reflects the invariant slots[newestSlotIdx] == lastWalCheckpoint.
+     */
+    walStreamInfo->checkpointHistory.Push(checkPoint);
     walStreamInfo->barrier.barrierCsn = stream->GetWalRecovery()->GetBarrierCsn();
     walStreamInfo->barrier.barrierEndPlsn = stream->GetWalRecovery()->GetBarrierEndPlsn();
     walStreamInfo->barrier.barrierSyncMode = stream->GetWalRecovery()->GetBarrierSyncMode();
-    ret = controlFile->UpdateWalStreamForCheckPointWithBarrier(
-        walId, walStreamInfo->lastCheckpointPLsn, walStreamInfo->lastWalCheckpoint, walStreamInfo->barrier);
+    ret = controlFile->UpdateWalStreamForCheckPointWithBarrier(*walStreamInfo);
     if (STORAGE_FUNC_FAIL(ret)) {
         controlFile->FreeWalStreamsInfo(walStreamInfo);
         LWLockRelease(&checkpointInfo->checkpointLwLock);
         return DSTORE_FAIL;
     }
-    controlFile->FreeWalStreamsInfo(walStreamInfo);
     checkpointInfo->lastCheckPoint = checkPoint;
+    {
+        errno_t rc = memcpy_s(&checkpointInfo->lastCheckPointHistory, sizeof(WalCheckPointHistory),
+                              &walStreamInfo->checkpointHistory, sizeof(WalCheckPointHistory));
+        storage_securec_check(rc, "\0", "\0");
+    }
+    controlFile->FreeWalStreamsInfo(walStreamInfo);
 
     LWLockRelease(&checkpointInfo->checkpointLwLock);
     ErrLog(DSTORE_LOG, MODULE_BUFFER,
@@ -324,6 +350,10 @@ void CheckpointMgr::Init()
         checkPointNode->lastCheckpointTime = time(nullptr);
         checkPointNode->recoveryLock.Init();
         checkPointNode->lastCheckPointRecoveryPlsn = walStreamInfo->lastCheckpointPLsn;
+        checkPointNode->lastCheckPoint = walStreamInfo->lastWalCheckpoint;
+        errno_t cpyRc = memcpy_s(&checkPointNode->lastCheckPointHistory, sizeof(WalCheckPointHistory),
+                                 &walStreamInfo->checkpointHistory, sizeof(WalCheckPointHistory));
+        storage_securec_check(cpyRc, "\0", "\0");
         DListPushTail(&m_checkpointInfoList, &(checkPointNode->node));
     }
     DstorePfreeExt(walIds);

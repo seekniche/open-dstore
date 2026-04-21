@@ -2005,8 +2005,8 @@ RetStatus StoragePdb::CreateCheckpointForWalStream(const WalStream *walStream, u
 
     walStreamInfo->lastCheckpointPLsn = 0; /* todo: use the start pos of the checkpoint wal record */
     walStreamInfo->lastWalCheckpoint = checkPoint;
-    ret = m_controlFile->UpdateWalStreamForCheckPoint(walId, walStreamInfo->lastCheckpointPLsn,
-                                                      walStreamInfo->lastWalCheckpoint);
+    walStreamInfo->checkpointHistory.Push(checkPoint);
+    ret = m_controlFile->UpdateWalStreamForCheckPoint(*walStreamInfo);
     if (STORAGE_FUNC_FAIL(ret)) {
         m_controlFile->FreeWalStreamsInfo(walStreamInfo);
         return ret;

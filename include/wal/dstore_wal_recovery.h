@@ -469,7 +469,34 @@ public:
 #ifndef UT
 private:
 #endif
-    void InitRecoveryPlsn(WalId walId, WalCheckPoint *lastWalCheckpoint);
+    /*
+     * Pick a recovery start PLSN out of the persisted checkpoint history.
+     *
+     * Fast path: if `streamInfo->lastWalCheckpoint.diskRecoveryPlsn` is a valid
+     * (non-zero) PLSN we keep the legacy behaviour and use it directly. This means
+     * normal-path recoveries see no behaviour change from this feature.
+     *
+     * Slow path: the newest checkpoint is missing or unparseable; iterate the
+     * `streamInfo->checkpointHistory` ring from second-newest to oldest and adopt the
+     * first slot whose PLSN parses as a valid wal group on disk. If every slot fails
+     * we panic via HandleAllSlotsCorrupted (operator must use waldump to repair the
+     * control file before retrying).
+     */
+    void InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemData *streamInfo);
+
+    /*
+     * Try to parse a wal group at `candidatePlsn` from disk for `walId`. Returns
+     * DSTORE_SUCC iff the group is well-formed (valid groupLen and CRC). Used by
+     * InitRecoveryPlsn's slow-path probe before PrepareBgThreads runs; it must
+     * therefore manage its own short-lived memory context and reader.
+     */
+    RetStatus ProbeWalGroupAtPlsn(WalId walId, uint64 candidatePlsn);
+
+    /*
+     * Slow-path terminal step: every slot in the history failed to probe. Dumps the
+     * full slot ring then panics so that operator intervention (waldump) is required.
+     */
+    void HandleAllSlotsCorrupted(WalId walId, const WalCheckPointHistory &history);
     static void InitRedoStatisticInfo(uint64 recoveryStartPlsn, uint32 redoWorkerNum);
     static void AddRedoStatisticInfo(double time, WalType walType,
         uint64 endPlsn, uint32 workerId, const WalRecord *walRecord);
@@ -479,7 +506,7 @@ private:
     RetStatus RedoWalRecord(WalRecordRedoContext *redoCtx, const WalRecord *walRecord, RedoWalRecordBuffPara *buffPara);
     inline void FillBatchRedoEntry(RedoWalRecordEntry &entry,
         const WalRecordRedoContext &redoCtx, const WalRecord *walRecord) const;
-    inline void AddPlsnSyncer(RedoWalRecordEntry &recordEntry, uint32 &recordEntryNum, uint64 recordEndPlsn);
+    void AddPlsnSyncer(RedoWalRecordEntry &recordEntry, uint32 &recordEntryNum, uint64 recordEndPlsn);
     RetStatus Redo(uint64 *lastGroupEndPlsn);
     RetStatus RedoLoadWalToBuffer(uint64 loadStartPlsn);
     WalRecordReader *RedoAllocateWalReader(uint64 readStartPlsn);
