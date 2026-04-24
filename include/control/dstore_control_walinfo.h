@@ -119,6 +119,16 @@ struct ControlWalStreamPageItemData {
         }
     }
 };
+
+/*
+ * One ControlWalStreamPageItemData must fit in a single control page after
+ * accounting for the page header. If a future change pushes the struct beyond
+ * this limit, see openspec change validate-checkpoint-lsn-on-recovery
+ * design Decision 1 for fallback options (WalCheckPointSlim or page split).
+ */
+static_assert(sizeof(ControlWalStreamPageItemData) <= (BLCKSZ - sizeof(ControlPageHeader)),
+              "ControlWalStreamPageItemData no longer fits in a single control page");
+
 using VnodeControlWalStreamPageItemDatas = ControlWalStreamPageItemData **;
 using WalStreamItemFilter = bool (*)(const ControlWalStreamPageItemData &walStreamItem);
 class ControlWalInfo : public ControlGroup {

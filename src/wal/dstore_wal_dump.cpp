@@ -98,6 +98,7 @@ RetStatus WalDumper::InitWalDumpConfig(WalDumpConfig &config)
     }
     PageDiagnose::InitCommConfig(&config.commConfig);
     config.checkPageError = false;
+    config.scanValidCheckpoint = false;
     return DSTORE_SUCC;
 }
 
@@ -985,6 +986,32 @@ RetStatus WalDumper::DumpOneWalStream()
     uint64 recordEndPlsn = 0;
     RetStatus retStatus;
     WalRecordReader *walRecordReader = m_walStreamReader->walRecordReader;
+
+    if (m_config.scanValidCheckpoint) {
+        uint64 lastValidEndPlsn = INVALID_PLSN;
+        uint64 validGroupCount = 0;
+        do {
+            retStatus = walRecordReader->ReadNext(&walGroup);
+            if (retStatus != DSTORE_SUCC || walGroup == nullptr) {
+                break;
+            }
+            uint64 startPlsn = walRecordReader->GetCurGroupStartPlsn();
+            uint64 endPlsn = walRecordReader->GetCurGroupEndPlsn();
+            (void)fprintf(DumpToolHelper::dumpPrint,
+                "valid_group plsn=%lu groupLen=%u crc=0x%08x endPlsn=%lu\n",
+                startPlsn, walGroup->groupLen, walGroup->crc, endPlsn);
+            lastValidEndPlsn = endPlsn;
+            validGroupCount++;
+            if (m_walStreamReader->endPlsn != WAL_DUMP_INVALID_PLSN &&
+                endPlsn >= m_walStreamReader->endPlsn) {
+                break;
+            }
+        } while (true);
+        (void)fprintf(DumpToolHelper::dumpPrint,
+            "scan_summary valid_group_count=%lu last_valid_group_end_plsn=%lu\n",
+            validGroupCount, lastValidEndPlsn);
+        return DSTORE_SUCC;
+    }
 
     do {
         retStatus = walRecordReader->ReadNext(&walGroup);

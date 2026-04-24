@@ -19,6 +19,9 @@
 #include "ut_utilities/ut_dstore_framework.h"
 #include "ut_mock/ut_mock.h"
 #include "ut_tablespace/ut_segment.h"
+#include "buffer/dstore_checkpointer.h"
+#include "control/dstore_control_file.h"
+#include "framework/dstore_pdb.h"
 #include "vfs/vfs_interface.h"
 #include "heap/dstore_heap_wal_struct.h"
 #include "tablespace/dstore_tablespace_wal.h"
@@ -94,6 +97,127 @@ protected:
         retStatus = m_controlFile->UpdateWalStream(*walStreamInfo);
         ASSERT_EQ(retStatus, DSTORE_SUCC);
         m_controlFile->FreeWalStreamsInfo(walStreamInfo);
+    }
+    WalCheckPoint BuildCheckpoint(uint64 diskRecoveryPlsn) const
+    {
+        WalCheckPoint checkpoint = {};
+        checkpoint.time = static_cast<Timestamp>(diskRecoveryPlsn);
+        checkpoint.diskRecoveryPlsn = diskRecoveryPlsn;
+        checkpoint.memoryCheckpoint.memRecoveryPlsn = diskRecoveryPlsn;
+        return checkpoint;
+    }
+
+    std::vector<WalGroupLsnInfo> CollectWalGroupInfos(uint32 expectedMinGroupNum)
+    {
+        WalReaderConf conf = {m_walStream->GetWalId(), m_startReadPlsn, m_walStream, nullptr, m_segSize,
+                              WalReadSource::WAL_READ_FROM_DISK};
+        WalRecordReader *walRecordReader = DstoreNew(m_ut_memory_context) WalRecordReader(m_ut_memory_context, conf);
+        std::vector<WalGroupLsnInfo> groupInfos;
+        if (walRecordReader == nullptr) {
+            ADD_FAILURE() << "failed to allocate WalRecordReader";
+            return groupInfos;
+        }
+        if (walRecordReader->Init() != DSTORE_SUCC) {
+            ADD_FAILURE() << "failed to initialize WalRecordReader";
+            delete walRecordReader;
+            return groupInfos;
+        }
+
+        const WalRecordAtomicGroup *walGroup = nullptr;
+        while (true) {
+            if (walRecordReader->ReadNext(&walGroup) != DSTORE_SUCC) {
+                ADD_FAILURE() << "failed to read wal group from disk";
+                delete walRecordReader;
+                return groupInfos;
+            }
+            if (walGroup == nullptr) {
+                break;
+            }
+            groupInfos.push_back({m_walStream->GetWalId(), walRecordReader->GetCurGroupStartPlsn(),
+                                  walRecordReader->GetCurGroupEndPlsn()});
+            while (walRecordReader->GetNextWalRecord() != nullptr) {
+            }
+        }
+        delete walRecordReader;
+        EXPECT_GE(groupInfos.size(), expectedMinGroupNum);
+        return groupInfos;
+    }
+
+    void InstallCheckpointHistory(ControlWalStreamPageItemData *streamInfo, const std::vector<uint64> &slotPlsns,
+                                  uint64 latestPlsn = INVALID_PLSN) const
+    {
+        ASSERT_NE(streamInfo, nullptr);
+        streamInfo->lastCheckpointPLsn = 0;
+        streamInfo->checkpointHistory = {};
+        for (uint64 slotPlsn : slotPlsns) {
+            streamInfo->checkpointHistory.Push(BuildCheckpoint(slotPlsn));
+        }
+        if (latestPlsn == INVALID_PLSN && !slotPlsns.empty()) {
+            latestPlsn = slotPlsns.back();
+        }
+        if (latestPlsn != INVALID_PLSN) {
+            streamInfo->lastWalCheckpoint = BuildCheckpoint(latestPlsn);
+            if (streamInfo->checkpointHistory.slotCount > 0) {
+                streamInfo->checkpointHistory.slots[streamInfo->checkpointHistory.newestSlotIdx] =
+                    streamInfo->lastWalCheckpoint;
+            }
+        }
+    }
+
+    void PersistCheckpointHistory(const std::vector<uint64> &slotPlsns, uint64 latestPlsn = INVALID_PLSN,
+                                  bool syncCheckpointMgr = false)
+    {
+        ControlWalStreamPageItemData *streamInfo = nullptr;
+        ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+        InstallCheckpointHistory(streamInfo, slotPlsns, latestPlsn);
+        ASSERT_EQ(m_controlFile->UpdateWalStream(*streamInfo), DSTORE_SUCC);
+        if (syncCheckpointMgr) {
+            CheckpointMgr *checkpointMgr = g_storageInstance->GetPdb(g_defaultPdbId)->GetCheckpointMgr();
+            ASSERT_NE(checkpointMgr, nullptr);
+            bool found = false;
+            dlist_iter iter;
+            dlist_foreach(iter, checkpointMgr->GetCheckpointInfoList()) {
+                WalCheckpointInfoData *checkpointInfo = dlist_container(WalCheckpointInfoData, node, iter.cur);
+                if (checkpointInfo->walId != streamInfo->walId) {
+                    continue;
+                }
+                checkpointInfo->lastCheckPointRecoveryPlsn = streamInfo->lastCheckpointPLsn;
+                checkpointInfo->lastCheckPoint = streamInfo->lastWalCheckpoint;
+                checkpointInfo->lastCheckPointHistory = streamInfo->checkpointHistory;
+                found = true;
+                break;
+            }
+            if (!found) {
+                checkpointMgr->Init();
+                dlist_foreach(iter, checkpointMgr->GetCheckpointInfoList()) {
+                    WalCheckpointInfoData *checkpointInfo = dlist_container(WalCheckpointInfoData, node, iter.cur);
+                    if (checkpointInfo->walId != streamInfo->walId) {
+                        continue;
+                    }
+                    checkpointInfo->lastCheckPointRecoveryPlsn = streamInfo->lastCheckpointPLsn;
+                    checkpointInfo->lastCheckPoint = streamInfo->lastWalCheckpoint;
+                    checkpointInfo->lastCheckPointHistory = streamInfo->checkpointHistory;
+                    found = true;
+                    break;
+                }
+            }
+            ASSERT_TRUE(found);
+        }
+        m_controlFile->FreeWalStreamsInfo(streamInfo);
+    }
+
+    void CorruptWalGroupLen(uint64 groupStartPlsn)
+    {
+        WalFile *walFile = m_walStream->GetWalFileManager()->GetWalFileByPlsn(groupStartPlsn);
+        ASSERT_NE(walFile, nullptr);
+        WalRecordAtomicGroup walGroup = {};
+        int64 readSize = 0;
+        int64 offset = static_cast<int64>(groupStartPlsn - walFile->GetStartPlsn());
+        ASSERT_EQ(walFile->Read(&walGroup, sizeof(walGroup), offset, &readSize), DSTORE_SUCC);
+        ASSERT_EQ(static_cast<uint64>(readSize), sizeof(walGroup));
+        walGroup.groupLen = sizeof(WalRecordAtomicGroup) - 1;
+        ASSERT_EQ(walFile->PwriteSync(&walGroup, sizeof(walGroup), offset), DSTORE_SUCC);
+        ASSERT_EQ(walFile->Fsync(), DSTORE_SUCC);
     }
     void WriteWalGroupsOfManyTypes(uint32 walGroupNum, bool needDDL = false)
     {
@@ -245,6 +369,7 @@ protected:
         m_walStreamManager->InitWalStreamBgWriter(m_walStream);
 
         m_walRecovery = m_walStream->GetWalRecovery();
+        m_startReadPlsn = m_walStream->GetMaxWrittenToFilePlsn();
     }
 
     void TearDown() override
@@ -405,6 +530,132 @@ TEST_F(WalRecoveryTest, ParallelWalRedoTest)
     controlFile->FreeWalStreamsInfo(walStreamInfo);
     m_walStream->DestroyBgWalWriter();
     ASSERT_EQ(m_walManager->Recovery(m_walStream->GetWalId(), g_defaultPdbId), DSTORE_SUCC);
+}
+
+TEST_F(WalRecoveryTest, UTWalRecovery_CheckpointHistory_NewestValid)
+{
+    WriteWalGroupsOfManyTypes(3);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(3);
+    ASSERT_GE(groups.size(), 3U);
+
+    ControlWalStreamPageItemData *streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    InstallCheckpointHistory(streamInfo,
+        {groups[0].m_startPlsn + 1, groups[1].m_startPlsn + 1, groups[2].m_startPlsn},
+        groups[2].m_startPlsn);
+
+    m_walRecovery->InitRecoveryPlsn(m_walStream->GetWalId(), streamInfo);
+    ASSERT_EQ(m_walRecovery->GetRecoveryStartPlsn(), groups[2].m_startPlsn);
+    ASSERT_EQ(m_walRecovery->GetDiskRecoveryStartPlsn(), groups[2].m_startPlsn);
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
+}
+
+TEST_F(WalRecoveryTest, UTWalRecovery_CheckpointHistory_NewestCorrupted)
+{
+    WriteWalGroupsOfManyTypes(3);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(3);
+    ASSERT_GE(groups.size(), 3U);
+    CorruptWalGroupLen(groups[2].m_startPlsn);
+
+    ControlWalStreamPageItemData *streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    InstallCheckpointHistory(streamInfo,
+        {groups[0].m_startPlsn, groups[1].m_startPlsn, groups[2].m_startPlsn},
+        groups[2].m_startPlsn);
+
+    m_walRecovery->InitRecoveryPlsn(m_walStream->GetWalId(), streamInfo);
+    ASSERT_EQ(m_walRecovery->GetRecoveryStartPlsn(), groups[1].m_startPlsn);
+    ASSERT_EQ(m_walRecovery->GetDiskRecoveryStartPlsn(), groups[1].m_startPlsn);
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
+}
+
+TEST_F(WalRecoveryTest, UTWalRecovery_CheckpointHistory_OnlyOldestValid)
+{
+    WriteWalGroupsOfManyTypes(3);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(3);
+    ASSERT_GE(groups.size(), 3U);
+    CorruptWalGroupLen(groups[2].m_startPlsn);
+    CorruptWalGroupLen(groups[1].m_startPlsn);
+
+    ControlWalStreamPageItemData *streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    InstallCheckpointHistory(streamInfo,
+        {groups[0].m_startPlsn, groups[1].m_startPlsn, groups[2].m_startPlsn},
+        groups[2].m_startPlsn);
+
+    m_walRecovery->InitRecoveryPlsn(m_walStream->GetWalId(), streamInfo);
+    ASSERT_EQ(m_walRecovery->GetRecoveryStartPlsn(), groups[0].m_startPlsn);
+    ASSERT_EQ(m_walRecovery->GetDiskRecoveryStartPlsn(), groups[0].m_startPlsn);
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
+}
+
+TEST_F(WalRecoveryTest, UTWalRecovery_CheckpointHistory_AllCorrupted)
+{
+    WriteWalGroupsOfManyTypes(3);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(3);
+    ASSERT_GE(groups.size(), 3U);
+    CorruptWalGroupLen(groups[2].m_startPlsn);
+    CorruptWalGroupLen(groups[1].m_startPlsn);
+    CorruptWalGroupLen(groups[0].m_startPlsn);
+
+    ControlWalStreamPageItemData *streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    InstallCheckpointHistory(streamInfo,
+        {groups[0].m_startPlsn, groups[1].m_startPlsn, groups[2].m_startPlsn},
+        groups[2].m_startPlsn);
+
+    EXPECT_DEATH(m_walRecovery->InitRecoveryPlsn(m_walStream->GetWalId(), streamInfo), "");
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
+}
+
+TEST_F(WalRecoveryTest, UTWalRecovery_CheckpointHistory_Truncate)
+{
+    WriteWalGroupsOfManyTypes(3);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(3);
+    ASSERT_GE(groups.size(), 3U);
+
+    PersistCheckpointHistory({groups[0].m_startPlsn, groups[1].m_startPlsn, groups[2].m_startPlsn + 1},
+        groups[2].m_startPlsn + 1);
+    m_walStream->DestroyBgWalWriter();
+
+    ASSERT_EQ(m_walManager->Recovery(m_walStream->GetWalId(), g_defaultPdbId), DSTORE_SUCC);
+    ASSERT_EQ(m_walRecovery->ProbeWalGroupAtPlsn(m_walStream->GetWalId(), groups[2].m_startPlsn), DSTORE_SUCC);
+}
+
+TEST_F(WalRecoveryTest, UTWalFileManager_RecyclablePlsn_TakesOldest)
+{
+    PersistCheckpointHistory({300, 100, 200}, 200, true);
+    ASSERT_EQ(m_walStream->GetWalFileManager()->GetRecyclablePlsn(), 100U);
+
+    PersistCheckpointHistory({}, 777, true);
+    ASSERT_EQ(m_walStream->GetWalFileManager()->GetRecyclablePlsn(), 777U);
+}
+
+TEST_F(WalRecoveryTest, UTControlWalInfo_BackwardCompat)
+{
+    WriteWalGroupsOfManyTypes(2);
+    std::vector<WalGroupLsnInfo> groups = CollectWalGroupInfos(2);
+    ASSERT_GE(groups.size(), 2U);
+
+    ControlWalStreamPageItemData *streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    streamInfo->checkpointHistory = {};
+    streamInfo->lastWalCheckpoint = BuildCheckpoint(groups[0].m_startPlsn);
+    ASSERT_EQ(m_controlFile->UpdateWalStream(*streamInfo), DSTORE_SUCC);
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
+
+    StoragePdb *pdb = g_storageInstance->GetPdb(g_defaultPdbId);
+    ASSERT_NE(pdb, nullptr);
+    ASSERT_EQ(pdb->CreateCheckpointForWalStream(m_walStream, groups[1].m_endPlsn), DSTORE_SUCC);
+
+    streamInfo = nullptr;
+    ASSERT_EQ(m_controlFile->GetWalStreamInfo(m_walStream->GetWalId(), &streamInfo), DSTORE_SUCC);
+    ASSERT_EQ(streamInfo->checkpointHistory.slotCount, 1);
+    ASSERT_EQ(streamInfo->checkpointHistory.newestSlotIdx, 0);
+    ASSERT_EQ(streamInfo->checkpointHistory.slots[0].diskRecoveryPlsn, groups[1].m_endPlsn);
+    ASSERT_EQ(streamInfo->lastWalCheckpoint.diskRecoveryPlsn,
+              streamInfo->checkpointHistory.slots[streamInfo->checkpointHistory.newestSlotIdx].diskRecoveryPlsn);
+    m_controlFile->FreeWalStreamsInfo(streamInfo);
 }
 
 TEST_F (WalRecoveryTest, DISABLED_BuildDirtyPageSetAndPageWalRecordListHtabTest)

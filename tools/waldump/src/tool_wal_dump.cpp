@@ -30,7 +30,26 @@
 #include "wal/dstore_wal_dump_file_reader.h"
 #include "wal/dstore_wal_dump.h"
 
+#include "patch_control_checkpoint.h"
+
 using namespace DSTORE;
+
+/* Long-only option ids for --patch-control-checkpoint and friends. */
+enum LongOnlyOpt : int {
+    OPT_LONG_BASE = 1000,
+    OPT_SCAN_VALID_CHECKPOINT,
+    OPT_WAL_DIR,
+    OPT_FROM_PLSN,
+    OPT_PATCH_CONTROL_CHECKPOINT,
+    OPT_CONTROL_FILE,
+    OPT_DRY_RUN,
+};
+
+static struct PatchCliState {
+    bool requested = false;
+    const char *controlFile = nullptr;
+    bool dryRun = false;
+} g_patchCli;
 
 static const char *g_progName = "waldump";
 
@@ -45,6 +64,45 @@ static RetStatus ParseTypeFilter(char *arg, WalDumpConfig &config);
 static RetStatus ParseXidFilter(char *arg, WalDumpConfig &config);
 
 static RetStatus ParseVfsName(char *arg, WalDumpConfig &config);
+
+static void ResetPatchCliState()
+{
+    g_patchCli = {};
+}
+
+static RetStatus ParseSinglePlsn(const char *arg, uint64 &plsn)
+{
+    if (sscanf_s(arg, "%lu", &plsn) != 1 || plsn == 0) {
+        (void)fprintf(stderr, "%s: could not parse \"%s\" as a valid plsn.\n", g_progName, arg);
+        return DSTORE_FAIL;
+    }
+    return DSTORE_SUCC;
+}
+
+static int HandlePatchControlCheckpointCommand(const WalDumpConfig &config)
+{
+    if (!g_patchCli.requested) {
+        return -1;
+    }
+
+    if (config.walId == INVALID_WAL_ID) {
+        (void)fprintf(stderr, "%s: --patch-control-checkpoint requires --walid/--wal-id.\n", g_progName);
+        return EXIT_FAILURE;
+    }
+    if (config.startPlsn == 0 || config.startPlsn == WAL_DUMP_INVALID_PLSN ||
+        config.endPlsn != WAL_DUMP_INVALID_PLSN) {
+        (void)fprintf(stderr, "%s: --patch-control-checkpoint requires a single --plsn value.\n", g_progName);
+        return EXIT_FAILURE;
+    }
+
+    PatchControlCheckpointArgs args = {
+        .controlFilePath = g_patchCli.controlFile,
+        .walId = config.walId,
+        .plsn = config.startPlsn,
+        .dryRun = g_patchCli.dryRun,
+    };
+    return STORAGE_FUNC_SUCC(RunPatchControlCheckpoint(args)) ? EXIT_SUCCESS : EXIT_FAILURE;
+}
 
 static void Usage()
 {
@@ -63,6 +121,10 @@ example3(dump wal in local directory):
     waldump -d /WAL_PATH/
 example4(dump WalStream that belongs to template pdb in PageStore):
     waldump -t 1 -g /PATH/tenant_gaussdb_start_config_1_1.json -b test_tenant.vfs.template_cdb
+example5(scan valid checkpoint candidates in a local wal dir):
+    waldump --scan-valid-checkpoint --wal-dir /WAL_PATH/ [--from-plsn 12345]
+example6(patch control file checkpoint for one wal stream):
+    waldump --patch-control-checkpoint --control-file /PATH/database_control_1 --wal-id 1 --plsn 12345 [--dry-run]
 
 WAL_STORAGE_TYPE:
   -t, --vfs_type=TYPE               Specify the vfs type: LocalFileSystem:0, PageStore:1
@@ -95,6 +157,13 @@ OUTPUT_FILTER:
   -D, --dumpDir=path                Path of the output file, (default: ./)
 
 OTHER:
+      --scan-valid-checkpoint       Scan local WAL files and print each valid group header plus
+                                    the last valid group end plsn
+      --wal-dir=DIR                 Local WAL directory used by --scan-valid-checkpoint
+      --from-plsn=PLSN              Start scanning from the given PLSN (single value)
+      --patch-control-checkpoint    Patch one WAL stream's latest checkpoint in a control file
+      --control-file=PATH           Target control file path for --patch-control-checkpoint
+      --dry-run                     Validate and print the patch without modifying the control file
   -h, --help                        Show this help and exit
   -V, --version                     Output version information and exit
 )");
@@ -112,13 +181,17 @@ static RetStatus ParseCmdLineInput(int argc, char **argv, WalDumpConfig &config)
     int option;
     int optIndex;
     const char *shortOptions = "w:p:s:n:m:t:x:d:v:g:f:kP:T:hVi:a:R:b:D:c";
+    ResetPatchCliState();
     struct option longOptions[] = {
         {"vfs_type", required_argument, nullptr, 't'},
         {"dir", required_argument, nullptr, 'd'},
+        {"wal-dir", required_argument, nullptr, OPT_WAL_DIR},
         {"vfs_config", required_argument, nullptr, 'g'},
         {"vfs_name", required_argument, nullptr, 'v'},
         {"walid", required_argument, nullptr, 'w'},
+        {"wal-id", required_argument, nullptr, 'w'},
         {"plsn", required_argument, nullptr, 'p'},
+        {"from-plsn", required_argument, nullptr, OPT_FROM_PLSN},
         {"after_checkpoint", no_argument, nullptr, 'k'},
         {"limit", required_argument, nullptr, 'n'},
         {"module", required_argument, nullptr, 'm'},
@@ -132,6 +205,10 @@ static RetStatus ParseCmdLineInput(int argc, char **argv, WalDumpConfig &config)
         {"comm_trd", required_argument, nullptr, 'R'},
         {"output path", required_argument, nullptr, 'D'},
         {"check_page_error", no_argument, nullptr, 'c'},
+        {"scan-valid-checkpoint", no_argument, nullptr, OPT_SCAN_VALID_CHECKPOINT},
+        {"patch-control-checkpoint", no_argument, nullptr, OPT_PATCH_CONTROL_CHECKPOINT},
+        {"control-file", required_argument, nullptr, OPT_CONTROL_FILE},
+        {"dry-run", no_argument, nullptr, OPT_DRY_RUN},
         {nullptr, 0, nullptr, 0}
     };
     while ((option = getopt_long(argc, argv, shortOptions, longOptions, &optIndex)) != -1) {
@@ -157,6 +234,13 @@ static RetStatus ParseCmdLineInput(int argc, char **argv, WalDumpConfig &config)
                     return DSTORE_FAIL;
                 }
                 break;
+            case OPT_WAL_DIR:
+                config.vfsType = StorageType::LOCAL;
+                if (sprintf_s(config.dir, MAXPGPATH, "%s", optarg) == -1) {
+                    (void)fprintf(stderr, "%s: sprintf wal-dir(%s) fail.\n", g_progName, optarg);
+                    return DSTORE_FAIL;
+                }
+                break;
             case 'g':
                 config.vfsConfigPath = strdup(optarg);
                 break;
@@ -173,6 +257,12 @@ static RetStatus ParseCmdLineInput(int argc, char **argv, WalDumpConfig &config)
                 break;
             case 'p':
                 if (STORAGE_FUNC_FAIL(ParsePlsnRange(optarg, config))) {
+                    return DSTORE_FAIL;
+                }
+                break;
+            case OPT_FROM_PLSN:
+                config.endPlsn = WAL_DUMP_INVALID_PLSN;
+                if (STORAGE_FUNC_FAIL(ParseSinglePlsn(optarg, config.startPlsn))) {
                     return DSTORE_FAIL;
                 }
                 break;
@@ -259,6 +349,18 @@ static RetStatus ParseCmdLineInput(int argc, char **argv, WalDumpConfig &config)
                 break;
             case 'c':
                 config.checkPageError = true;
+                break;
+            case OPT_SCAN_VALID_CHECKPOINT:
+                config.scanValidCheckpoint = true;
+                break;
+            case OPT_PATCH_CONTROL_CHECKPOINT:
+                g_patchCli.requested = true;
+                break;
+            case OPT_CONTROL_FILE:
+                g_patchCli.controlFile = optarg;
+                break;
+            case OPT_DRY_RUN:
+                g_patchCli.dryRun = true;
                 break;
             default:
                 return DSTORE_FAIL;
@@ -419,6 +521,15 @@ int main(int argc, char **argv)
     if (STORAGE_FUNC_FAIL(retStatus)) {
         goto ERROR_EXIT;
     }
+    {
+        int patchExitCode = HandlePatchControlCheckpointCommand(config);
+        if (patchExitCode >= 0) {
+            free(config.vfsConfigPath);
+            free(config.pdbVfsName);
+            free(config.commConfig.localIp);
+            return patchExitCode;
+        }
+    }
     if (config.commandType != WalDumpCommandType::DUMP_WAL_RECORD) {
         return EXIT_SUCCESS;
     }
@@ -451,4 +562,3 @@ ERROR_EXIT:
     fflush(stderr);
     return EXIT_FAILURE;
 }
-

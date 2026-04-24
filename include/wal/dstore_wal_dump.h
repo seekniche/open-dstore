@@ -90,6 +90,12 @@ struct WalDumpConfig {
     char dumpDir[MAXPGPATH];
     PageDiagnose::DumpCommConfig commConfig;
     bool checkPageError;
+    /*
+     * When true, DumpOneWalStream prints one line per valid wal group header
+     * instead of decoding records, and prints the final last_valid_group_end_plsn.
+     * Set by `waldump --scan-valid-checkpoint`.
+     */
+    bool scanValidCheckpoint;
 };
 
 enum class WalDumpGetRecordType {

@@ -35,6 +35,7 @@
 #include "port/dstore_port.h"
 #include "index/dstore_btree_recycle_wal.h"
 #include "wal/dstore_wal_reader.h"
+#include "wal/dstore_wal_logstream.h"
 #include "wal/dstore_wal_parallel_redo_worker.h"
 #include "wal/dstore_wal_perf_statistic.h"
 #include "wal/dstore_wal_perf_unit.h"
@@ -2007,6 +2008,32 @@ void WalRecovery::HandleAllSlotsCorrupted(WalId walId, const WalCheckPointHistor
                 m_pdbId, walId, i, history.slots[i].time, history.slots[i].diskRecoveryPlsn,
                 history.slots[i].memoryCheckpoint.memRecoveryPlsn));
     }
+
+    WalFileManager *fileMgr = (m_walStream != nullptr) ? m_walStream->GetWalFileManager() : nullptr;
+    if (fileMgr != nullptr) {
+        uint16 fileCount = fileMgr->GetAllWalFileCount();
+        WalFile *head = fileMgr->GetHeadWalFile();
+        WalFile *tail = fileMgr->GetTailWalFile();
+        uint64 minPlsn = (head != nullptr) ? head->GetStartPlsn() : INVALID_PLSN;
+        uint64 tailStart = (tail != nullptr) ? tail->GetStartPlsn() : INVALID_PLSN;
+        uint64 maxPlsn = (tail != nullptr) ? (tailStart + m_walFileSize) : INVALID_PLSN;
+        ErrLog(DSTORE_ERROR, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]  WAL file count:%hu visible plsn range:[%lu, %lu) walFileSize:%lu.",
+                m_pdbId, walId, fileCount, minPlsn, maxPlsn, m_walFileSize));
+        for (WalFile *cur = head; cur != nullptr; cur = cur->GetNext()) {
+            ErrLog(DSTORE_ERROR, MODULE_WAL,
+                ErrMsg("[PDB:%u WAL:%lu]    WalFile name:%s startPlsn:%lu flushedPlsn:%lu.",
+                    m_pdbId, walId, cur->GetFileName(), cur->GetStartPlsn(), cur->GetFlushedPlsn()));
+            if (cur == tail) {
+                break;
+            }
+        }
+    } else {
+        ErrLog(DSTORE_ERROR, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]  WalFileManager unavailable; cannot dump WAL file list.",
+                m_pdbId, walId));
+    }
+
     ErrLog(DSTORE_PANIC, MODULE_WAL,
         ErrMsg("[PDB:%u WAL:%lu]WalRecovery cannot select a recovery start plsn from checkpoint history.",
             m_pdbId, walId));
@@ -2015,9 +2042,23 @@ void WalRecovery::HandleAllSlotsCorrupted(WalId walId, const WalCheckPointHistor
 void WalRecovery::InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemData *streamInfo)
 {
     const WalCheckPoint &latest = streamInfo->lastWalCheckpoint;
+    const WalCheckPointHistory &history = streamInfo->checkpointHistory;
     uint64 diskRecoveryPlsn = latest.diskRecoveryPlsn;
     uint64 memRecoveryPlsn = latest.memoryCheckpoint.memRecoveryPlsn;
     m_diskRecoveryStartPlsn = diskRecoveryPlsn;
+
+    /*
+     * Fresh streams have no persisted checkpoint yet: legacy UT fixtures create
+     * wal-stream metadata with lastWalCheckpoint.diskRecoveryPlsn == INVALID_PLSN
+     * and an empty history. Treat that as "start from 0" instead of corruption.
+     */
+    if (diskRecoveryPlsn == INVALID_PLSN && history.slotCount == 0) {
+        m_recoveryStartPlsn = INVALID_PLSN;
+        ErrLog(DSTORE_LOG, MODULE_WAL,
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery found no persisted checkpoint yet; start from plsn:%lu.",
+                m_pdbId, walId, m_recoveryStartPlsn));
+        return;
+    }
 
     /*
      * Fast path: probe the newest checkpoint's diskRecoveryPlsn. When the probe
@@ -2049,7 +2090,6 @@ void WalRecovery::InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemDa
      * skip it to avoid a redundant probe (invariant I3: slots[newestSlotIdx] ==
      * lastWalCheckpoint).
      */
-    const WalCheckPointHistory &history = streamInfo->checkpointHistory;
     for (uint8 k = 1; k < history.slotCount; ++k) {
         uint8 idx = history.GetSlotIdxByAge(k);
         const WalCheckPoint &slot = history.slots[idx];
@@ -2066,9 +2106,9 @@ void WalRecovery::InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemDa
         m_diskRecoveryStartPlsn = slot.diskRecoveryPlsn;
         m_recoveryStartPlsn = slot.diskRecoveryPlsn;
         ErrLog(DSTORE_WARNING, MODULE_WAL,
-            ErrMsg("[PDB:%u WAL:%lu]WalRecovery checkpoint(slow) adopted slot age=%hhu (idx=%hhu) "
+            ErrMsg("[PDB:%u WAL:%lu]WalRecovery rolled back %hhu checkpoint(s), adopted slot age=%hhu (idx=%hhu) "
                    "diskRecoveryPlsn:%lu memRecoveryPlsn:%lu.",
-                m_pdbId, walId, k, idx, slot.diskRecoveryPlsn, slot.memoryCheckpoint.memRecoveryPlsn));
+                m_pdbId, walId, k, k, idx, slot.diskRecoveryPlsn, slot.memoryCheckpoint.memRecoveryPlsn));
         return;
     }
 

@@ -26,6 +26,7 @@ message(STATUS "EXCLUDE SRC " ${UT_EXCLUDE_FLASHBACK})
 
 # Exclude tests that depend on mockcpp (not installed in this env)
 LIST(REMOVE_ITEM unittest_src_list "src/ut_transaction/ut_transaction.cpp")
+LIST(APPEND unittest_src_list "../../tools/waldump/src/patch_control_checkpoint.cpp")
 
 message(STATUS "${unittest_src_list}")
 
@@ -58,6 +59,7 @@ set(unittest_macro_options ${MACRO_OPTIONS})
 set(unittest_include_directories
     ${PROJECT_SOURCE_DIR}/interface
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/tools/waldump/src
     ${SECURE_INCLUDE_PATH}
     ${UTILS_INCLUDE_PATH}
     ${CJSON_INCLUDE_PATH}

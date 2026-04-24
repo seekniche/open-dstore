@@ -148,6 +148,16 @@ static RetStatus GetWalCheckpoint(ControlPage *controlPage, uint32 curPageId,
             "GetWalCheckpoint find checkpoint at page:%u, time:%ld diskPlsn:%lu memPlsn:%lu.\n",
             curPageId, walStreamPage->lastWalCheckpoint.time, walStreamPage->lastWalCheckpoint.diskRecoveryPlsn,
             walStreamPage->lastWalCheckpoint.memoryCheckpoint.memRecoveryPlsn);
+        const WalCheckPointHistory &history = walStreamPage->checkpointHistory;
+        (void)fprintf(DumpToolHelper::dumpPrint,
+            "GetWalCheckpoint history: slotCount:%hhu newestSlotIdx:%hhu.\n",
+            history.slotCount, history.newestSlotIdx);
+        for (uint8 i = 0; i < history.slotCount; ++i) {
+            (void)fprintf(DumpToolHelper::dumpPrint,
+                "  slot[%hhu] time:%ld diskPlsn:%lu memPlsn:%lu.\n", i,
+                history.slots[i].time, history.slots[i].diskRecoveryPlsn,
+                history.slots[i].memoryCheckpoint.memRecoveryPlsn);
+        }
         break;
     }
     return DSTORE_SUCC;

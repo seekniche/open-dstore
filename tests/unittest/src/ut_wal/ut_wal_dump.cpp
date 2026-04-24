@@ -15,6 +15,9 @@
  * along with this program. if not, see <https://www.gnu.org/licenses/>.
  */
 #include "ut_wal/ut_wal_basic.h"
+#include "common/algorithm/dstore_checksum_impl.h"
+#include "control/dstore_control_file_page.h"
+#include "control/dstore_control_walinfo.h"
 #include "heap/dstore_heap_wal_struct.h"
 #include "index/dstore_btree_wal.h"
 #include "index/dstore_btree_recycle_wal.h"
@@ -24,6 +27,11 @@
 #include "wal/dstore_wal_dump.h"
 #include "ut_mock/ut_mock.h"
 #include "systable/dstore_systable_wal.h"
+#include "patch_control_checkpoint.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace DSTORE {
 
@@ -289,6 +297,65 @@ protected:
         (void)m_walWriter->EndAtomicWal();
         DstorePfree(data);
     }
+
+    std::string MakeTempControlFilePath()
+    {
+        char pathTemplate[] = "/tmp/ut_waldump_control_XXXXXX";
+        int fd = mkstemp(pathTemplate);
+        if (fd < 0) {
+            ADD_FAILURE() << "mkstemp failed for temporary control file path";
+            return "";
+        }
+        close(fd);
+        unlink(pathTemplate);
+        return std::string(pathTemplate);
+    }
+
+    void CreatePatchableControlFile(const std::string &path, uint64 walId, uint64 diskRecoveryPlsn)
+    {
+        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+        ASSERT_GE(fd, 0);
+        off_t fileSize = static_cast<off_t>(CONTROLFILE_PAGEMAP_WALSTREAM_START + 1) * BLCKSZ;
+        ASSERT_EQ(ftruncate(fd, fileSize), 0);
+
+        ControlDataPage page = {};
+        page.InitDataPage(CONTROL_WAL_STREAM_DATAPAGE_TYPE);
+        ControlWalStreamPageItemData item = {};
+        item.walId = walId;
+        item.lastWalCheckpoint.diskRecoveryPlsn = diskRecoveryPlsn;
+        item.checkpointHistory.Push(item.lastWalCheckpoint);
+        ASSERT_EQ(page.AddItem(&item, sizeof(item)), DSTORE_SUCC);
+        page.m_pageHeader.m_checksum = CompChecksum(reinterpret_cast<const uint8 *>(&page), BLCKSZ, CHECKSUM_CRC);
+
+        off_t offset = static_cast<off_t>(CONTROLFILE_PAGEMAP_WALSTREAM_START) * BLCKSZ;
+        ASSERT_EQ(pwrite(fd, &page, BLCKSZ, offset), BLCKSZ);
+        close(fd);
+    }
+
+    ControlWalStreamPageItemData ReadPatchedWalStreamItem(const std::string &path, uint32 *pageChecksum = nullptr)
+    {
+        ControlWalStreamPageItemData item = {};
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            ADD_FAILURE() << "open failed for control file " << path;
+            return item;
+        }
+        ControlDataPage page = {};
+        off_t offset = static_cast<off_t>(CONTROLFILE_PAGEMAP_WALSTREAM_START) * BLCKSZ;
+        if (pread(fd, &page, BLCKSZ, offset) != BLCKSZ) {
+            ADD_FAILURE() << "pread failed for control file " << path;
+            close(fd);
+            return item;
+        }
+        close(fd);
+
+        if (pageChecksum != nullptr) {
+            *pageChecksum = page.m_pageHeader.m_checksum;
+        }
+        errno_t rc = memcpy_s(&item, sizeof(item), page.m_data, sizeof(item));
+        storage_securec_check(rc, "\0", "\0");
+        return item;
+    }
     WalDumper *m_walDumper = nullptr;
     WalDumpConfig m_walDumpConfig = {};
     uint64 m_segSize;
@@ -397,5 +464,62 @@ TEST_F(WalDumpTest, WaldumpCheckPageError)
     m_walWriter->WaitTargetPlsnPersist(page->GetWalId(), page->GetPlsn());
     m_bufferMgr->UnlockAndRelease(bufferDesc);
     UtMockModule::UtDropTableSpace(tablespace);
+}
+
+TEST_F(WalDumpTest, PatchControlCheckpointDryRunAndLiveMode)
+{
+    constexpr uint64 WAL_ID = 17;
+    constexpr uint64 OLD_PLSN = 0x12340;
+    constexpr uint64 DRY_RUN_PLSN = 0x23450;
+    constexpr uint64 LIVE_PLSN = 0x34560;
+
+    std::string controlFilePath = MakeTempControlFilePath();
+    std::string backupPath = controlFilePath + ".bak";
+    CreatePatchableControlFile(controlFilePath, WAL_ID, OLD_PLSN);
+
+    struct stat before = {};
+    ASSERT_EQ(stat(controlFilePath.c_str(), &before), 0);
+
+    PatchControlCheckpointArgs args = {
+        .controlFilePath = controlFilePath.c_str(),
+        .walId = WAL_ID,
+        .plsn = DRY_RUN_PLSN,
+        .dryRun = true,
+    };
+    ASSERT_EQ(RunPatchControlCheckpoint(args), DSTORE_SUCC);
+
+    struct stat afterDryRun = {};
+    ASSERT_EQ(stat(controlFilePath.c_str(), &afterDryRun), 0);
+    ASSERT_EQ(before.st_mtim.tv_sec, afterDryRun.st_mtim.tv_sec);
+    ASSERT_EQ(before.st_mtim.tv_nsec, afterDryRun.st_mtim.tv_nsec);
+    ASSERT_EQ(access(backupPath.c_str(), F_OK), -1);
+
+    ControlWalStreamPageItemData item = ReadPatchedWalStreamItem(controlFilePath);
+    ASSERT_EQ(item.lastWalCheckpoint.diskRecoveryPlsn, OLD_PLSN);
+    ASSERT_EQ(item.checkpointHistory.slotCount, 1);
+    ASSERT_EQ(item.checkpointHistory.slots[item.checkpointHistory.newestSlotIdx].diskRecoveryPlsn, OLD_PLSN);
+
+    args.plsn = LIVE_PLSN;
+    args.dryRun = false;
+    ASSERT_EQ(RunPatchControlCheckpoint(args), DSTORE_SUCC);
+    ASSERT_EQ(access(backupPath.c_str(), F_OK), 0);
+
+    uint32 pageChecksum = 0;
+    item = ReadPatchedWalStreamItem(controlFilePath, &pageChecksum);
+    ASSERT_EQ(item.lastWalCheckpoint.diskRecoveryPlsn, LIVE_PLSN);
+    ASSERT_EQ(item.checkpointHistory.slotCount, 1);
+    ASSERT_EQ(item.checkpointHistory.slots[item.checkpointHistory.newestSlotIdx].diskRecoveryPlsn, LIVE_PLSN);
+
+    ControlDataPage page = {};
+    int fd = open(controlFilePath.c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    off_t offset = static_cast<off_t>(CONTROLFILE_PAGEMAP_WALSTREAM_START) * BLCKSZ;
+    ASSERT_EQ(pread(fd, &page, BLCKSZ, offset), BLCKSZ);
+    close(fd);
+    page.m_pageHeader.m_checksum = 0;
+    ASSERT_EQ(pageChecksum, CompChecksum(reinterpret_cast<const uint8 *>(&page), BLCKSZ, CHECKSUM_CRC));
+
+    unlink(controlFilePath.c_str());
+    unlink(backupPath.c_str());
 }
 }

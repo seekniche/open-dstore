@@ -236,10 +236,10 @@ struct WalCheckPoint {
  */
 constexpr uint8 WAL_CHECKPOINT_HISTORY_SLOTS = 3;
 
+#pragma pack(push, 1)
 struct WalCheckPointHistory {
     uint8 slotCount;
     uint8 newestSlotIdx;
-    uint16 _pad;
     WalCheckPoint slots[WAL_CHECKPOINT_HISTORY_SLOTS];
 
     /* k = 0 returns the newest slot, k = slotCount-1 the oldest. */
@@ -277,6 +277,7 @@ struct WalCheckPointHistory {
         }
     }
 };
+#pragma pack(pop)
 
 /*
  * Barrier info for control info.

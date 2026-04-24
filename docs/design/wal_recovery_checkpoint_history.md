@@ -45,6 +45,28 @@
 - **读**：recovery 启动时，按"从新到旧"遍历这 N 条 checkpoint，对每个 `diskRecoveryPlsn` 调用 group header 校验；**第一个通过校验的位置**即作为 `m_recoveryStartPlsn`。
 - **回收**：WAL 文件回收门槛由"最新 checkpoint 的 diskRecoveryPlsn"放宽为"**N 槽中最旧的 diskRecoveryPlsn**"，确保所有历史槽对应的 WAL 物理上仍然存在。
 
+### 2.2 总体闭环流程图
+
+```mermaid
+flowchart TD
+    A[Checkpoint completes] --> B[Push new WalCheckPoint into history ring]
+    B --> C[Sync lastWalCheckpoint = newest slot]
+    C --> D[Single control-page write with CRC]
+    D --> E[WAL retention lower bound = oldest slot diskRecoveryPlsn]
+
+    F[Recovery starts] --> G[Read lastWalCheckpoint and checkpointHistory]
+    G --> H{Fast-path probe latest slot}
+    H -->|success| I[Use latest diskRecoveryPlsn]
+    H -->|fail| J[Probe older slots from new to old]
+    J -->|first success| K[Roll back N checkpoint(s) and continue redo]
+    J -->|all fail| L[Panic and dump slot/WAL diagnostics]
+
+    L --> M[Operator runs waldump --scan-valid-checkpoint]
+    M --> N[Find valid group start/end candidates]
+    N --> O[Operator runs waldump --patch-control-checkpoint]
+    O --> P[Restart and recover from repaired checkpoint]
+```
+
 ### 2.1 为什么"回退到老 checkpoint"是安全的
 
 历史 checkpoint 的 `diskRecoveryPlsn` 比当前 checkpoint 更小（更靠前）。redo 是幂等的：从更早的位置开始回放，会把 [old_plsn, latest_plsn] 这段 WAL 多回放一遍，对页面的最终状态没有影响（`WalRecovery::IsLsnError` / `GetWalRecordReplayType` 已具备幂等过滤逻辑）。代价仅是**recovery 时间变长**（多回放一段 WAL），换得的是"checkpoint 位置写坏时仍能恢复"。
@@ -63,19 +85,22 @@
 // include/wal/dstore_wal_struct.h
 constexpr uint8 WAL_CHECKPOINT_HISTORY_SLOTS = 3; // 编译期常量，不做 GUC
 
+#pragma pack(push, 1)
 struct WalCheckPointHistory {
     uint8  slotCount;                                  // 实际有效槽数（启动初期可能 < N）
     uint8  newestSlotIdx;                              // 最新一条所在的槽下标 [0, N)
-    uint16 _pad;
     WalCheckPoint slots[WAL_CHECKPOINT_HISTORY_SLOTS]; // 环形数组
 
     // —— 辅助函数（详见 §3.4）——
     uint64 GetOldestDiskRecoveryPlsn() const;          // N 槽中最旧的 diskRecoveryPlsn
     uint8  GetSlotIdxByAge(uint8 k) const;             // 第 k 老槽的下标，k=0 即最新
 };
+#pragma pack(pop)
 ```
 
 `slots[newestSlotIdx]` 是最新的一条；按 `(newestSlotIdx + N - k) % N` 倒序遍历得到第 k 老的一条。
+
+> 这里用 `#pragma pack(push, 1)` 紧凑布局：`slotCount` / `newestSlotIdx` 两个 `uint8` 之后，`WalCheckPoint`（首字段是 8 字节的 `Timestamp`）会触发 6 字节自然对齐空洞；显式塞 `uint16 _pad` 既不优雅又得在每个 memcpy/memset 路径上小心处理它的语义，所以改为用 pack 让编译器去掉空洞，按字节紧凑排布写入 control page。
 
 #### 3.1.2 修改 `ControlWalStreamPageItemData`
 
@@ -129,6 +154,21 @@ controlFile->UpdateWalStreamForCheckPointWithBarrier(walId, ..., *walStreamInfo)
 > 写入仍然是一次 control page 的原子刷盘（`PostGroup`，受 `CFLockMode::CF_EXCLUSIVE` 保护，crc 校验），不引入新的并发问题。
 
 `UpdateWalStreamForCheckPointWithBarrier` 的签名调整：原签名中的 `const WalCheckPoint &lastWalCheckpoint` 入参**直接替换为整个 `walStreamInfo` 的引用**（即 `const ControlWalStreamPageItemData &streamInfo`），这样函数内部既能拿到 `lastWalCheckpoint` 也能拿到 `checkpointHistory`，避免再加第二个参数（`src/control/dstore_control_walinfo.cpp:126`）。`UpdateWalStreamForCheckPoint` 同步调整。
+
+```mermaid
+flowchart TD
+    A[CheckpointMgr::DoCheckpoint] --> B[Load walStreamInfo.checkpointHistory]
+    B --> C{slotCount == 0?}
+    C -->|yes| D[nextSlot = 0]
+    C -->|no| E[nextSlot = newestSlotIdx + 1 mod N]
+    D --> F[slots[nextSlot] = checkPoint]
+    E --> F
+    F --> G[newestSlotIdx = nextSlot]
+    G --> H[slotCount = min(slotCount + 1, N)]
+    H --> I[lastWalCheckpoint = checkPoint]
+    I --> J[UpdateWalStreamForCheckPointWithBarrier(..., walStreamInfo)]
+    J --> K[Control page persisted once with barrier/CRC]
+```
 
 ### 3.3 读路径：recovery 启动时按新到旧验证
 
@@ -187,6 +227,25 @@ void WalRecovery::InitRecoveryPlsn(WalId walId, const ControlWalStreamPageItemDa
 1. **零侵入**：99.999% 情况下 `lastWalCheckpoint` 是合法的，走快路径后直接 return，新代码路径完全不被触发，老逻辑的行为与改造前完全一致 —— **任何 N 槽侧的潜在 bug（探测函数误判、环形索引算错、兼容字段未同步等）都不会污染正常恢复路径**。
 2. **故障半径收敛**：新逻辑只在"老逻辑已经失败"时才被启用；这本身就是异常路径，多走几次探测、记录更多日志、走更保守的回退策略都是可接受的。
 3. **与不变式 I3 自洽**：因为 `lastWalCheckpoint == slots[newestSlotIdx]`，快路径 + 慢路径从 k=1 开始遍历，**不会重复探测同一位置**，也不会丢漏任何槽。
+
+```mermaid
+flowchart TD
+    A[WalRecovery::Init] --> B[InitRecoveryPlsn(streamInfo)]
+    B --> C[latest = lastWalCheckpoint]
+    C --> D{ProbeWalGroupAtPlsn(latest) succeeds?}
+    D -->|yes| E[Set m_recoveryStartPlsn = latest]
+    E --> F[Continue normal redo]
+    D -->|no| G[Warn and enter history fallback]
+    G --> H[For k = 1 .. slotCount - 1]
+    H --> I[Pick slot by age from new to old]
+    I --> J{Probe slot succeeds?}
+    J -->|yes| K[Adopt that slot and log rolled back k checkpoint(s)]
+    K --> F
+    J -->|no| L{More older slots?}
+    L -->|yes| H
+    L -->|no| M[HandleAllSlotsCorrupted]
+    M --> N[Panic with slot dump + WAL file list]
+```
 
 #### 3.3.1 `ProbeWalGroupAtPlsn` —— 校验函数
 
@@ -363,3 +422,16 @@ N=3、checkpoint 周期分钟级别时多保留几百 MB 到几 GB —— 这是
 - 探测时不仅校验 group header，还向后多读一个 group，验证两组之间 `prevGroupPlsn` 串得起来。
 - 把"恢复时回退了几步"作为一个 perf counter 暴露，运维可监控。
 
+## 9. 关联 OpenSpec 变更
+
+本文档对应的 OpenSpec change 与规范化需求位于：
+
+- 提案与设计：[`openspec/changes/validate-checkpoint-lsn-on-recovery/proposal.md`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/proposal.md)、[`design.md`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/design.md)
+- 任务清单：[`tasks.md`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/tasks.md)
+- 能力规范（spec）：
+  - [`wal-checkpoint-history`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/specs/wal-checkpoint-history/spec.md) — 3 槽环形缓冲区与不变式
+  - [`wal-recovery-checkpoint-fallback`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/specs/wal-recovery-checkpoint-fallback/spec.md) — 探测式快/慢路径与 PANIC 兜底
+  - [`wal-recycle-history-floor`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/specs/wal-recycle-history-floor/spec.md) — WAL 回收下界改为最老历史槽
+  - [`waldump-checkpoint-recovery-tools`](../../openspec/changes/validate-checkpoint-lsn-on-recovery/specs/waldump-checkpoint-recovery-tools/spec.md) — `waldump --scan-valid-checkpoint` / `--patch-control-checkpoint`
+
+后续考古请优先从 OpenSpec change 入口出发，本设计文档仅记录决策来源。
