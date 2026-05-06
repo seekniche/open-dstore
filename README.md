@@ -1,5 +1,11 @@
 **Dstore是一个可独立编译，独立测试的数据库存储引擎组件。**
 
+# macOS 编译说明
+
+如果在 macOS 上编译 Dstore，建议使用 OrbStack/Docker 编译环境，并参考 [Dstore macOS 本机编译说明](BUILD_MAC.md)。
+
+该说明仅针对 macOS 本机编译场景，包含从零准备同级 `local_libs/` 依赖目录、创建 Docker 镜像/长期容器、执行 release/debug 编译等步骤；其他系统请继续参考下方通用编译流程。
+
 
 # 一、环境配置
 
